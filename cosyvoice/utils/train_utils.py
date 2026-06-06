@@ -114,7 +114,7 @@ def wrap_cuda_model(args, model):
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     if args.train_engine == "torch_ddp":  # native pytorch ddp
         assert (torch.cuda.is_available())
-        model.cuda()
+        model.musa()
         model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
     else:
         if int(os.environ.get('RANK', 0)) == 0:
@@ -232,25 +232,14 @@ def save_model(model, model_name, info_dict):
         logging.info('[Rank {}] Checkpoint: save to checkpoint {}'.format(rank, save_model_path))
 
 
-def cosyvoice_join(group_join, info_dict):
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    rank = int(os.environ.get('RANK', 0))
+def distributed_batch_available(has_batch, control_group):
+    """Stop all ranks at the shortest input without poisoning the process group."""
+    if dist.get_world_size() == 1:
+        return has_batch
 
-    if info_dict["batch_idx"] != 0:
-        # we try to join all rank in both ddp and deepspeed mode, in case different rank has different lr
-        try:
-            dist.monitored_barrier(group=group_join,
-                                   timeout=group_join.options._timeout)
-            return False
-        except RuntimeError as e:
-            logging.info("Detected uneven workload distribution: {}\n".format(e) +
-                         "Break current worker to manually join all workers, " +
-                         "world_size {}, current rank {}, current local_rank {}\n".
-                         format(world_size, rank, local_rank))
-            return True
-    else:
-        return False
+    available = torch.tensor(int(has_batch), dtype=torch.int32)
+    dist.all_reduce(available, op=dist.ReduceOp.MIN, group=control_group)
+    return bool(available.item())
 
 
 def batch_forward(model, batch, scaler, info_dict, ref_model=None, dpo_loss=None):

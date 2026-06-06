@@ -22,6 +22,7 @@ import os
 import random
 import numpy as np
 import torch
+import musa_patch
 import torch.distributed as dist
 import deepspeed
 
@@ -60,7 +61,7 @@ def get_args():
     parser.add_argument('--ddp.dist_backend',
                         dest='dist_backend',
                         default='nccl',
-                        choices=['nccl', 'gloo'],
+                        choices=['nccl', 'gloo', 'mccl'],
                         help='distributed backend')
     parser.add_argument('--num_workers',
                         default=0,
@@ -94,7 +95,7 @@ def get_args():
     parser.add_argument('--timeout',
                         default=60,
                         type=int,
-                        help='timeout (in seconds) of cosyvoice_join.')
+                        help='timeout (in seconds) for distributed control collectives.')
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
     return args
@@ -104,6 +105,8 @@ def get_args():
 def main():
     args = get_args()
     os.environ['onnx_path'] = args.onnx_path
+    os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+    os.environ.setdefault('RAYON_NUM_THREADS', '1')
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -188,18 +191,20 @@ def main():
     scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
     print('start step {} start epoch {}'.format(start_step, start_epoch))
 
-    # Start training loop
-    for epoch in range(start_epoch + 1, info_dict['max_epoch']):
-        executor.epoch = epoch
-        train_dataset.set_epoch(epoch)
-        dist.barrier()
-        group_join = dist.new_group(backend="gloo", timeout=datetime.timedelta(seconds=args.timeout))
-        if gan is True:
-            executor.train_one_epoc_gan(model, optimizer, scheduler, optimizer_d, scheduler_d, train_data_loader, cv_data_loader,
-                                        writer, info_dict, scaler, group_join)
-        else:
-            executor.train_one_epoc(model, optimizer, scheduler, train_data_loader, cv_data_loader, writer, info_dict, scaler, group_join, ref_model=ref_model)
-        dist.destroy_process_group(group_join)
+    # Keep one healthy Gloo group for lightweight host-side control collectives.
+    control_group = dist.new_group(backend="gloo", timeout=datetime.timedelta(seconds=args.timeout))
+    try:
+        for epoch in range(start_epoch + 1, info_dict['max_epoch']):
+            executor.epoch = epoch
+            train_dataset.set_epoch(epoch)
+            dist.barrier()
+            if gan is True:
+                executor.train_one_epoc_gan(model, optimizer, scheduler, optimizer_d, scheduler_d, train_data_loader, cv_data_loader,
+                                            writer, info_dict, scaler, control_group)
+            else:
+                executor.train_one_epoc(model, optimizer, scheduler, train_data_loader, cv_data_loader, writer, info_dict, scaler, control_group, ref_model=ref_model)
+    finally:
+        dist.destroy_process_group(control_group)
 
 
 if __name__ == '__main__':

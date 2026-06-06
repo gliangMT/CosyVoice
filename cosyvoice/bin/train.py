@@ -19,6 +19,8 @@ import logging
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 from copy import deepcopy
 import os
+import random
+import numpy as np
 import torch
 import torch.distributed as dist
 import deepspeed
@@ -68,6 +70,10 @@ def get_args():
                         default=100,
                         type=int,
                         help='prefetch number')
+    parser.add_argument('--seed',
+                        default=1986,
+                        type=int,
+                        help='random seed')
     parser.add_argument('--pin_memory',
                         action='store_true',
                         default=False,
@@ -98,6 +104,11 @@ def get_args():
 def main():
     args = get_args()
     os.environ['onnx_path'] = args.onnx_path
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.musa.manual_seed_all(args.seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s')
     # gan train has some special initialization logic

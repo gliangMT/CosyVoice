@@ -16,11 +16,13 @@
 
 import logging
 import os
+import random
 import torch
 import json
 import re
 import datetime
 import yaml
+import numpy as np
 
 import deepspeed
 import torch.optim as optim
@@ -34,6 +36,12 @@ from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem
 
 from cosyvoice.dataset.dataset import Dataset
 from cosyvoice.utils.scheduler import WarmupLR, NoamHoldAnnealing, ConstantLR
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def init_distributed(args):
@@ -55,17 +63,27 @@ def init_dataset_and_dataloader(args, configs, gan, dpo):
     train_dataset = Dataset(args.train_data, data_pipeline=data_pipeline, mode='train', gan=gan, dpo=dpo, shuffle=True, partition=True)
     cv_dataset = Dataset(args.cv_data, data_pipeline=data_pipeline, mode='dev', gan=gan, dpo=dpo, shuffle=False, partition=False)
 
+    rank = int(os.environ.get('RANK', 0))
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed + rank)
+    cv_generator = torch.Generator()
+    cv_generator.manual_seed(args.seed + 10000 + rank)
+    loader_kwargs = {
+        'batch_size': None,
+        'pin_memory': args.pin_memory,
+        'num_workers': args.num_workers,
+        'worker_init_fn': seed_worker,
+    }
+    if args.num_workers > 0:
+        loader_kwargs['prefetch_factor'] = args.prefetch
+
     # do not use persistent_workers=True, as whisper tokenizer opens tiktoken file each time when the for loop starts
     train_data_loader = DataLoader(train_dataset,
-                                   batch_size=None,
-                                   pin_memory=args.pin_memory,
-                                   num_workers=args.num_workers,
-                                   prefetch_factor=args.prefetch)
+                                   generator=train_generator,
+                                   **loader_kwargs)
     cv_data_loader = DataLoader(cv_dataset,
-                                batch_size=None,
-                                pin_memory=args.pin_memory,
-                                num_workers=args.num_workers,
-                                prefetch_factor=args.prefetch)
+                                generator=cv_generator,
+                                **loader_kwargs)
     return train_dataset, cv_dataset, train_data_loader, cv_data_loader
 
 

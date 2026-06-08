@@ -25,6 +25,16 @@ import re
 import inflect
 from cosyvoice.utils.file_utils import logging, load_wav
 from cosyvoice.utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, split_paragraph, is_only_punctuation
+from cosyvoice.utils.device import get_available_device
+
+
+def get_speech_tokenizer_providers():
+    available_providers = onnxruntime.get_available_providers()
+    if 'MUSAExecutionProvider' in available_providers:
+        return ['MUSAExecutionProvider', 'CPUExecutionProvider']
+    elif 'CUDAExecutionProvider' in available_providers:
+        return ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    return ['CPUExecutionProvider']
 
 
 class CosyVoiceFrontEnd:
@@ -38,14 +48,13 @@ class CosyVoiceFrontEnd:
                  allowed_special: str = 'all'):
         self.tokenizer = get_tokenizer()
         self.feat_extractor = feat_extractor
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = get_available_device()
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
         self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
         self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
-                                                                     providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
-                                                                                "CPUExecutionProvider"])
+                                                                     providers=get_speech_tokenizer_providers())
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device, weights_only=True)
         else:

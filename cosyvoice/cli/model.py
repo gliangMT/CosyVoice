@@ -19,11 +19,11 @@ import numpy as np
 import threading
 import time
 from torch.nn import functional as F
-from contextlib import nullcontext
 import uuid
 from cosyvoice.utils.common import fade_in_out
 from cosyvoice.utils.file_utils import convert_onnx_to_trt, export_cosyvoice2_vllm
 from cosyvoice.utils.common import TrtContextWrapper
+from cosyvoice.utils.device import empty_cache_and_sync, get_available_device, stream_context
 
 
 class CosyVoiceModel:
@@ -33,7 +33,7 @@ class CosyVoiceModel:
                  flow: torch.nn.Module,
                  hift: torch.nn.Module,
                  fp16: bool = False):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = get_available_device()
         self.llm = llm
         self.flow = flow
         self.hift = hift
@@ -52,7 +52,7 @@ class CosyVoiceModel:
         # rtf and decoding related
         self.stream_scale_factor = 1
         assert self.stream_scale_factor >= 1, 'stream_scale_factor should be greater than 1, change it according to your actual rtf'
-        self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
+        self.llm_context = stream_context(self.device)
         self.lock = threading.Lock()
         # dict used to store session related variable
         self.tts_speech_token_dict = {}
@@ -237,9 +237,7 @@ class CosyVoiceModel:
             self.mel_overlap_dict.pop(this_uuid)
             self.hift_cache_dict.pop(this_uuid)
             self.flow_cache_dict.pop(this_uuid)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.current_stream().synchronize()
+        empty_cache_and_sync(self.device)
 
 
 class CosyVoice2Model(CosyVoiceModel):
@@ -249,7 +247,7 @@ class CosyVoice2Model(CosyVoiceModel):
                  flow: torch.nn.Module,
                  hift: torch.nn.Module,
                  fp16: bool = False):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = get_available_device()
         self.llm = llm
         self.flow = flow
         self.hift = hift
@@ -266,7 +264,7 @@ class CosyVoice2Model(CosyVoiceModel):
         # speech fade in out
         self.speech_window = np.hamming(2 * self.source_cache_len)
         # rtf and decoding related
-        self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
+        self.llm_context = stream_context(self.device)
         self.lock = threading.Lock()
         # dict used to store session related variable
         self.tts_speech_token_dict = {}
@@ -389,9 +387,7 @@ class CosyVoice2Model(CosyVoiceModel):
             self.tts_speech_token_dict.pop(this_uuid)
             self.llm_end_dict.pop(this_uuid)
             self.hift_cache_dict.pop(this_uuid)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.current_stream().synchronize()
+        empty_cache_and_sync(self.device)
 
 
 class CosyVoice3Model(CosyVoice2Model):
@@ -401,7 +397,7 @@ class CosyVoice3Model(CosyVoice2Model):
                  flow: torch.nn.Module,
                  hift: torch.nn.Module,
                  fp16: bool = False):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = get_available_device()
         self.llm = llm
         self.flow = flow
         self.hift = hift
@@ -413,7 +409,7 @@ class CosyVoice3Model(CosyVoice2Model):
         self.stream_scale_factor = 2
         assert self.stream_scale_factor >= 1, 'stream_scale_factor should be greater than 1, change it according to your actual rtf'
         # rtf and decoding related
-        self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
+        self.llm_context = stream_context(self.device)
         self.lock = threading.Lock()
         # dict used to store session related variable
         self.tts_speech_token_dict = {}

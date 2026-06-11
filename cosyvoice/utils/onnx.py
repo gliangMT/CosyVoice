@@ -4,6 +4,24 @@ import os
 import torchaudio.compliance.kaldi as kaldi
 
 
+def get_speech_tokenizer_providers(device_id):
+    available_providers = onnxruntime.get_available_providers()
+    requested_provider = os.environ.get('COSYVOICE_ONNX_PROVIDER', 'auto').lower()
+    if requested_provider == 'cpu':
+        return ['CPUExecutionProvider']
+    if requested_provider == 'musa':
+        if 'MUSAExecutionProvider' not in available_providers:
+            raise RuntimeError('MUSAExecutionProvider is not available')
+        return [('MUSAExecutionProvider', {'device_id': device_id}), 'CPUExecutionProvider']
+    if requested_provider not in ('auto', ''):
+        raise ValueError('COSYVOICE_ONNX_PROVIDER must be cpu, musa, or auto')
+    if 'MUSAExecutionProvider' in available_providers:
+        return [('MUSAExecutionProvider', {'device_id': device_id}), 'CPUExecutionProvider']
+    elif 'CUDAExecutionProvider' in available_providers:
+        return [('CUDAExecutionProvider', {'device_id': device_id}), 'CPUExecutionProvider']
+    return ['CPUExecutionProvider']
+
+
 class SpeechTokenExtractor():
     def __init__(self, model_path):
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -12,7 +30,7 @@ class SpeechTokenExtractor():
         option.intra_op_num_threads = 1
         self.speech_tokenizer_session = onnxruntime.InferenceSession(model_path,
                                                                      sess_options=option,
-                                                                     providers=[("CUDAExecutionProvider", {'device_id': self.local_rank})])
+                                                                     providers=get_speech_tokenizer_providers(self.local_rank))
 
     def inference(self, feat, feat_lengths, device):
         speech_token = self.speech_tokenizer_session.run(None,

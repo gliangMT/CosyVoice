@@ -182,6 +182,9 @@ python3 webui.py --port 50000 --model_dir pretrained_models/CosyVoice-300M
 
 For advanced users, we have provided training and inference scripts in `examples/libritts`.
 
+For checkpoint resume and fault-tolerant training, see
+[CosyVoice Resume Training Guide](docs/cosyvoice_resume_training.md).
+
 #### Build for deployment
 
 Optionally, if you want service deployment,

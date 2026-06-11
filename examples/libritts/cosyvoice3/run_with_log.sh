@@ -1,6 +1,13 @@
 #!/bin/bash
 # Copyright 2024 Alibaba Inc. All Rights Reserved.
+set -eo pipefail
+
 . ./path.sh || exit 1;
+
+WORK_DIR="$(pwd)"
+TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
+LOG_DIR="${WORK_DIR}/logs/S5000_train_${TIMESTAMP}"
+mkdir -p "${LOG_DIR}"
 
 stage=5
 stop_stage=5
@@ -54,8 +61,28 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
 fi
 
 # train llm
+export COSYVOICE_ONNX_PROVIDER="${COSYVOICE_ONNX_PROVIDER:-musa}"
+
+# musa platform
+# export MUSA_VISIBLE_DEVICES="4,5,6,7"
 export MUSA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-#export MUSA_VISIBLE_DEVICES="5"
+export MUSA_EXECUTION_TIMEOUT="${MUSA_EXECUTION_TIMEOUT:-3200000}"
+export ACCELERATOR_BACKEND="${ACCELERATOR_BACKEND:-musa}"
+
+export MCCL_PROTOS="${MCCL_PROTOS:-2}"
+export MCCL_ALGOS="${MCCL_ALGOS:-1}"
+export MCCL_BUFFSIZE="${MCCL_BUFFSIZE:-20971520}"
+export MCCL_MAX_NCHANNELS="${MCCL_MAX_NCHANNELS:-14}"
+export MCCL_CHECK_POINTERS="${MCCL_CHECK_POINTERS:-0}"
+export MCCL_IB_GID_INDEX="${MCCL_IB_GID_INDEX:-3}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
+
+# musa debug
+# export MUSA_LAUNCH_BLOCKING=1
+
 # num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
 num_gpus=$(echo $MUSA_VISIBLE_DEVICES | awk -F "," '{print NF}')
 job_id=1986
@@ -70,7 +97,7 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   fi
   cat data/{train-clean-100,train-clean-360,train-other-500}/parquet/data.list > data/train.data.list
   cat data/{dev-clean,dev-other}/parquet/data.list > data/dev.data.list
-  for model in flow ; do
+  for model in llm; do
     torchrun --nnodes=1 --nproc_per_node=$num_gpus \
         --rdzv_id=$job_id --rdzv_backend="c10d" --rdzv_endpoint="localhost:1234" \
       ../../../cosyvoice/bin/train.py \
@@ -90,7 +117,9 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
       --pin_memory \
       --use_amp \
       --deepspeed_config ./conf/ds_stage2.json \
-      --deepspeed.save_states model+optimizer "$@"
+      --resume auto \
+      --save_per_step 1000 \
+      --deepspeed.save_states model+optimizer $@ 2>&1 | tee ${LOG_DIR}/log_${TIMESTAMP}.txt
   done
 fi
 

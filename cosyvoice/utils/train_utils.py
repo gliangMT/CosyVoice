@@ -16,11 +16,13 @@
 
 import logging
 import os
+import glob
 import random
 import torch
 import json
 import re
 import datetime
+import warnings
 import yaml
 import numpy as np
 
@@ -65,9 +67,9 @@ def init_dataset_and_dataloader(args, configs, gan, dpo):
 
     rank = int(os.environ.get('RANK', 0))
     train_generator = torch.Generator()
-    train_generator.manual_seed(args.seed + rank)
+    train_generator.manual_seed(args.data_seed + rank)
     cv_generator = torch.Generator()
-    cv_generator.manual_seed(args.seed + 10000 + rank)
+    cv_generator.manual_seed(args.data_seed + 10000 + rank)
     loader_kwargs = {
         'batch_size': None,
         'pin_memory': args.pin_memory,
@@ -210,25 +212,185 @@ def init_summarywriter(args):
     return writer
 
 
-def save_model(model, model_name, info_dict):
+def set_scheduler_step(scheduler, step):
+    scheduler.set_step(step)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        lrs = scheduler.get_lr()
+    for param_group, lr in zip(scheduler.optimizer.param_groups, lrs):
+        param_group['lr'] = lr
+    scheduler._last_lr = lrs
+
+
+def seed_dataloader_for_epoch(data_loader, epoch, data_seed):
+    rank = int(os.environ.get('RANK', 0))
+    epoch_seed = data_seed + epoch * 100000 + rank
+    if data_loader.generator is not None:
+        data_loader.generator.manual_seed(epoch_seed)
+    if data_loader.num_workers == 0:
+        random.seed(epoch_seed)
+        np.random.seed(epoch_seed % (2 ** 32))
+
+
+def capture_rng_state():
+    state = {'torch': torch.get_rng_state()}
+    try:
+        if hasattr(torch, 'musa') and torch.musa.is_available():
+            state['accelerator'] = torch.musa.get_rng_state()
+            state['accelerator_type'] = 'musa'
+        elif torch.cuda.is_available():
+            state['accelerator'] = torch.cuda.get_rng_state()
+            state['accelerator_type'] = 'cuda'
+    except Exception as ex:
+        logging.warning('Failed to capture accelerator RNG state: %s', ex)
+    return state
+
+
+def restore_rng_state(state):
+    if not state:
+        return
+    torch.set_rng_state(state['torch'])
+    try:
+        if state.get('accelerator_type') == 'musa':
+            torch.musa.set_rng_state(state['accelerator'])
+        elif state.get('accelerator_type') == 'cuda':
+            torch.cuda.set_rng_state(state['accelerator'])
+    except Exception as ex:
+        logging.warning('Failed to restore accelerator RNG state: %s', ex)
+
+
+def _atomic_torch_save(obj, path):
+    tmp_path = '{}.tmp.{}'.format(path, os.getpid())
+    try:
+        torch.save(obj, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _atomic_write_text(text, path):
+    tmp_path = '{}.tmp.{}'.format(path, os.getpid())
+    try:
+        with open(tmp_path, 'w') as fout:
+            fout.write(text)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def training_state_path(checkpoint_path):
+    return re.sub(r'\.pt$', '.train.pt', checkpoint_path)
+
+
+def find_latest_ddp_checkpoint(model_dir):
+    latest_path = os.path.join(model_dir, 'latest_ddp')
+    if os.path.isfile(latest_path):
+        with open(latest_path, 'r') as fin:
+            checkpoint_name = fin.read().strip()
+        checkpoint_path = os.path.join(model_dir, checkpoint_name)
+        if os.path.isfile(checkpoint_path):
+            return checkpoint_path
+        logging.warning('Ignoring stale latest_ddp entry %s', checkpoint_name)
+
+    candidates = [
+        path for path in glob.glob(os.path.join(model_dir, 'epoch_*.pt'))
+        if not path.endswith('.train.pt')
+    ]
+    if not candidates:
+        raise FileNotFoundError('No resumable DDP checkpoint found in {}'.format(model_dir))
+    return max(candidates, key=os.path.getmtime)
+
+
+def resolve_ddp_resume_checkpoint(resume, model_dir):
+    if resume == 'auto':
+        return find_latest_ddp_checkpoint(model_dir)
+    if os.path.isdir(resume):
+        return find_latest_ddp_checkpoint(resume)
+    checkpoint_path = os.path.abspath(resume)
+    if checkpoint_path.endswith('.train.pt'):
+        checkpoint_path = checkpoint_path[:-len('.train.pt')] + '.pt'
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError('Resume checkpoint not found: {}'.format(checkpoint_path))
+    return checkpoint_path
+
+
+def load_training_state(checkpoint_path, optimizer, scheduler,
+                        optimizer_d=None, scheduler_d=None, scaler=None):
+    state_path = training_state_path(checkpoint_path)
+    if not os.path.isfile(state_path):
+        logging.warning(
+            'Training state %s is missing; resuming weights, epoch, and step only. '
+            'Optimizer momentum and AMP scaler will be reset.', state_path)
+        return {}, None
+
+    state = torch.load(state_path, map_location='cpu', weights_only=False)
+    optimizer.load_state_dict(state['optimizer'])
+    scheduler.load_state_dict(state['scheduler'])
+    if optimizer_d is not None and state.get('optimizer_d') is not None:
+        optimizer_d.load_state_dict(state['optimizer_d'])
+    if scheduler_d is not None and state.get('scheduler_d') is not None:
+        scheduler_d.load_state_dict(state['scheduler_d'])
+    if scaler is not None and state.get('scaler') is not None:
+        scaler.load_state_dict(state['scaler'])
+
+    rank = int(os.environ.get('RANK', 0))
+    rng_path = re.sub(r'\.pt$', '.rank{}.rng.pt'.format(rank), checkpoint_path)
+    rng_state = None
+    if os.path.isfile(rng_path):
+        rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+    else:
+        logging.warning('RNG state %s is missing; resume will not be bit-exact.', rng_path)
+    return state, rng_state
+
+
+def save_model(model, model_name, info_dict, optimizer=None, scheduler=None,
+               optimizer_d=None, scheduler_d=None, scaler=None):
     rank = int(os.environ.get('RANK', 0))
     model_dir = info_dict["model_dir"]
     save_model_path = os.path.join(model_dir, '{}.pt'.format(model_name))
 
     if info_dict["train_engine"] == "torch_ddp":
         if rank == 0:
-            torch.save({**model.module.state_dict(), 'epoch': info_dict['epoch'], 'step': info_dict['step']}, save_model_path)
+            _atomic_torch_save(
+                {**model.module.state_dict(),
+                 'epoch': info_dict['epoch'],
+                 'step': info_dict['step']},
+                save_model_path)
+            if info_dict.get('save_states') == 'model+optimizer' and optimizer is not None:
+                state = {
+                    'format_version': 1,
+                    'model_checkpoint': os.path.basename(save_model_path),
+                    'epoch': info_dict['epoch'],
+                    'step': info_dict['step'],
+                    'train_batch_idx': info_dict.get('train_batch_idx', -1),
+                    'epoch_complete': info_dict.get('epoch_complete', False),
+                    'world_size': dist.get_world_size(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'optimizer_d': optimizer_d.state_dict() if optimizer_d is not None else None,
+                    'scheduler_d': scheduler_d.state_dict() if scheduler_d is not None else None,
+                    'scaler': scaler.state_dict() if scaler is not None else None,
+                }
+                _atomic_torch_save(state, training_state_path(save_model_path))
+        if info_dict.get('save_states') == 'model+optimizer' and optimizer is not None:
+            rng_path = re.sub(r'\.pt$', '.rank{}.rng.pt'.format(rank), save_model_path)
+            _atomic_torch_save(capture_rng_state(), rng_path)
     else:
         with torch.no_grad():
             model.save_checkpoint(save_dir=model_dir,
                                   tag=model_name,
                                   client_state=info_dict)
+        rng_path = os.path.join(model_dir, model_name, 'rank{}.rng.pt'.format(rank))
+        _atomic_torch_save(capture_rng_state(), rng_path)
     if rank == 0:
         info_path = re.sub('.pt$', '.yaml', save_model_path)
         info_dict['save_time'] = datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')
-        with open(info_path, 'w') as fout:
-            data = yaml.dump(info_dict)
-            fout.write(data)
+        _atomic_write_text(yaml.dump(info_dict), info_path)
+        if info_dict["train_engine"] == "torch_ddp" and model_name != 'init':
+            _atomic_write_text(os.path.basename(save_model_path),
+                               os.path.join(model_dir, 'latest_ddp'))
         logging.info('[Rank {}] Checkpoint: save to checkpoint {}'.format(rank, save_model_path))
 
 
@@ -346,7 +508,14 @@ def log_per_step(writer, info_dict):
 
     # TRAIN & CV, Shell log (stdout)
     if (info_dict['batch_idx'] + 1) % info_dict['log_interval'] == 0:
-        log_str = '{} Batch {}/{} '.format(tag, epoch, batch_idx + 1)
+        completed_step = step
+        if tag == 'TRAIN':
+            if info_dict['train_engine'] == 'deepspeed':
+                completed_step += int(info_dict.get('is_gradient_accumulation_boundary', False))
+            else:
+                completed_step += int((batch_idx + 1) % info_dict['accum_grad'] == 0)
+        log_str = '{} Epoch {} Batch {} Step {} '.format(
+            tag, epoch, batch_idx + 1, completed_step)
         for name, value in loss_dict.items():
             log_str += '{} {:.6f} '.format(name, value)
         if tag == "TRAIN":
@@ -365,10 +534,10 @@ def log_per_save(writer, info_dict):
     rank = int(os.environ.get('RANK', 0))
     logging.info(
         'Epoch {} Step {} CV info lr {} {} rank {}'.format(
-            epoch, step + 1, lr, rank, ' '.join(['{} {}'.format(k, v) for k, v in loss_dict.items()])))
+            epoch, step, lr, ' '.join(['{} {}'.format(k, v) for k, v in loss_dict.items()]), rank))
 
     if writer is not None:
         for k in ['epoch', 'lr']:
-            writer.add_scalar('{}/{}'.format(tag, k), info_dict[k], step + 1)
+            writer.add_scalar('{}/{}'.format(tag, k), info_dict[k], step)
         for k, v in loss_dict.items():
-            writer.add_scalar('{}/{}'.format(tag, k), v, step + 1)
+            writer.add_scalar('{}/{}'.format(tag, k), v, step)

@@ -62,13 +62,21 @@ class CosyVoiceModel:
         self.hift_cache_dict = {}
         self.silent_tokens = []
 
+    def _load_weight_state_dict(self, model_path):
+        state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
+        if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+            state_dict = state_dict['state_dict']
+        if isinstance(state_dict, dict):
+            state_dict = {k: v for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
+        return state_dict
+
     def load(self, llm_model, flow_model, hift_model):
-        self.llm.load_state_dict(torch.load(llm_model, map_location=self.device, weights_only=True), strict=True)
+        self.llm.load_state_dict(self._load_weight_state_dict(llm_model), strict=True)
         self.llm.to(self.device).eval()
-        self.flow.load_state_dict(torch.load(flow_model, map_location=self.device, weights_only=True), strict=True)
+        self.flow.load_state_dict(self._load_weight_state_dict(flow_model), strict=True)
         self.flow.to(self.device).eval()
         # in case hift_model is a hifigan model
-        hift_state_dict = {k.replace('generator.', ''): v for k, v in torch.load(hift_model, map_location=self.device, weights_only=True).items()}
+        hift_state_dict = {k.replace('generator.', ''): v for k, v in self._load_weight_state_dict(hift_model).items()}
         self.hift.load_state_dict(hift_state_dict, strict=True)
         self.hift.to(self.device).eval()
 

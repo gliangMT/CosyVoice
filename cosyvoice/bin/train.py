@@ -35,7 +35,7 @@ from cosyvoice.utils.train_utils import (
     init_dataset_and_dataloader,
     init_optimizer_and_scheduler,
     init_summarywriter, load_training_state, resolve_ddp_resume_checkpoint,
-    save_model, set_scheduler_step,
+    save_model, set_global_random_seed, set_scheduler_step,
     wrap_cuda_model, check_modify_and_save_config)
 
 
@@ -78,6 +78,14 @@ def get_args():
                         default=1986,
                         type=int,
                         help='per-epoch data pipeline seed used for resumable iteration')
+    parser.add_argument('--seed',
+                        default=1986,
+                        type=int,
+                        help='model and training random seed')
+    parser.add_argument('--deterministic',
+                        action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='require deterministic PyTorch algorithms')
     parser.add_argument('--save_per_step',
                         type=int,
                         help='override train_conf.save_per_step; <= 0 disables intra-epoch checkpoints')
@@ -115,6 +123,7 @@ def main():
     os.environ['onnx_path'] = args.onnx_path
     os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
     os.environ.setdefault('RAYON_NUM_THREADS', '1')
+    set_global_random_seed(args.seed, args.deterministic)
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s')
     # gan train has some special initialization logic
@@ -125,6 +134,7 @@ def main():
         override_dict.pop('hift')
     if args.qwen_pretrain_path is not None:
         override_dict['qwen_pretrain_path'] = args.qwen_pretrain_path
+    override_dict['seed'] = args.seed
     with open(args.config, 'r') as f:
         configs = load_hyperpyyaml(f, overrides=override_dict)
     if gan is True:

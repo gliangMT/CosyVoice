@@ -185,6 +185,9 @@ For advanced users, we have provided training and inference scripts in `examples
 For checkpoint resume and fault-tolerant training, see
 [CosyVoice Resume Training Guide](docs/cosyvoice_resume_training.md).
 
+For random seed control and reproducibility, see
+[CosyVoice Random Seed Reproducibility Guide](docs/random_seed_reproducibility.md).
+
 #### Build for deployment
 
 Optionally, if you want service deployment,

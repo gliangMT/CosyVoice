@@ -46,6 +46,15 @@ def seed_worker(worker_id):
     np.random.seed(worker_seed)
 
 
+def set_global_random_seed(seed, deterministic=True):
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
+    torch.manual_seed(seed)
+    if hasattr(torch, 'musa') and torch.musa.is_available():
+        torch.musa.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(deterministic)
+
+
 def init_distributed(args):
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -233,7 +242,11 @@ def seed_dataloader_for_epoch(data_loader, epoch, data_seed):
 
 
 def capture_rng_state():
-    state = {'torch': torch.get_rng_state()}
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
     try:
         if hasattr(torch, 'musa') and torch.musa.is_available():
             state['accelerator'] = torch.musa.get_rng_state()
@@ -249,7 +262,16 @@ def capture_rng_state():
 def restore_rng_state(state):
     if not state:
         return
-    torch.set_rng_state(state['torch'])
+    if 'python' in state:
+        random.setstate(state['python'])
+    else:
+        logging.warning('Python RNG state is missing; resume will not be bit-exact.')
+    if 'numpy' in state:
+        np.random.set_state(state['numpy'])
+    else:
+        logging.warning('NumPy RNG state is missing; resume will not be bit-exact.')
+    if 'torch' in state:
+        torch.set_rng_state(state['torch'])
     try:
         if state.get('accelerator_type') == 'musa':
             torch.musa.set_rng_state(state['accelerator'])

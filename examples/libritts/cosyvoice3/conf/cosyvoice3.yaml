@@ -1,8 +1,9 @@
 # set random seed, so that you may reproduce your result.
-__set_seed1: !apply:random.seed [1986]
-__set_seed2: !apply:numpy.random.seed [1986]
-__set_seed3: !apply:torch.manual_seed [1986]
-__set_seed4: !apply:torch.cuda.manual_seed_all [1986]
+seed: 1986
+__set_seed1: !apply:random.seed [!ref <seed>]
+__set_seed2: !apply:numpy.random.seed [!ref <seed>]
+__set_seed3: !apply:torch.manual_seed [!ref <seed>]
+__set_seed4: !apply:torch.cuda.manual_seed_all [!ref <seed>]
 
 # fixed params
 sample_rate: 24000

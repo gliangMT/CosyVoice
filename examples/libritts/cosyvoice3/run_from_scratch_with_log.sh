@@ -117,12 +117,15 @@ job_id="${job_id:-1986}"
 dist_backend="${dist_backend:-mccl}"
 num_workers="${num_workers:-2}"
 prefetch="${prefetch:-100}"
+seed="${seed:-1986}"
+data_seed="${data_seed:-1986}"
 train_engine="${train_engine:-torch_ddp}"
 rdzv_endpoint="${rdzv_endpoint:-localhost:1234}"
 
 if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
   echo "Engineering scratch training: ${MODELS}"
   echo "No pretrained CosyVoice module checkpoint will be loaded."
+  echo "Model seed: ${seed}; data seed: ${data_seed}; deterministic algorithms: enabled"
 
   cat data/{train-clean-100,train-clean-360,train-other-500}/parquet/data.list > data/train.data.list
   cat data/{dev-clean,dev-other}/parquet/data.list > data/dev.data.list
@@ -161,6 +164,8 @@ if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
       --ddp.dist_backend "${dist_backend}" \
       --num_workers "${num_workers}" \
       --prefetch "${prefetch}" \
+      --seed "${seed}" \
+      --data_seed "${data_seed}" \
       --pin_memory \
       --use_amp \
       --deepspeed_config ./conf/ds_stage2.json \

@@ -16,11 +16,16 @@
 
 import logging
 import os
+import glob
+import hashlib
+import random
 import torch
 import json
 import re
 import datetime
+import warnings
 import yaml
+import numpy as np
 
 import deepspeed
 import torch.optim as optim
@@ -34,6 +39,24 @@ from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem
 
 from cosyvoice.dataset.dataset import Dataset
 from cosyvoice.utils.scheduler import WarmupLR, NoamHoldAnnealing, ConstantLR
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def set_global_random_seed(seed, deterministic=True):
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.use_deterministic_algorithms(deterministic)
 
 
 def init_distributed(args):
@@ -55,18 +78,38 @@ def init_dataset_and_dataloader(args, configs, gan, dpo):
     train_dataset = Dataset(args.train_data, data_pipeline=data_pipeline, mode='train', gan=gan, dpo=dpo, shuffle=True, partition=True)
     cv_dataset = Dataset(args.cv_data, data_pipeline=data_pipeline, mode='dev', gan=gan, dpo=dpo, shuffle=False, partition=False)
 
+    rank = int(os.environ.get('RANK', 0))
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.data_seed + rank)
+    cv_generator = torch.Generator()
+    cv_generator.manual_seed(args.data_seed + 10000 + rank)
+    loader_kwargs = {
+        'batch_size': None,
+        'pin_memory': args.pin_memory,
+        'num_workers': args.num_workers,
+        'worker_init_fn': seed_worker,
+    }
+    if args.num_workers > 0:
+        loader_kwargs['prefetch_factor'] = args.prefetch
+
     # do not use persistent_workers=True, as whisper tokenizer opens tiktoken file each time when the for loop starts
     train_data_loader = DataLoader(train_dataset,
-                                   batch_size=None,
-                                   pin_memory=args.pin_memory,
-                                   num_workers=args.num_workers,
-                                   prefetch_factor=args.prefetch)
+                                   generator=train_generator,
+                                   **loader_kwargs)
     cv_data_loader = DataLoader(cv_dataset,
-                                batch_size=None,
-                                pin_memory=args.pin_memory,
-                                num_workers=args.num_workers,
-                                prefetch_factor=args.prefetch)
+                                generator=cv_generator,
+                                **loader_kwargs)
     return train_dataset, cv_dataset, train_data_loader, cv_data_loader
+
+
+def seed_dataloader_for_epoch(data_loader, epoch, data_seed):
+    rank = int(os.environ.get('RANK', 0))
+    epoch_seed = data_seed + epoch * 100000 + rank
+    if data_loader.generator is not None:
+        data_loader.generator.manual_seed(epoch_seed)
+    if data_loader.num_workers == 0:
+        random.seed(epoch_seed)
+        np.random.seed(epoch_seed % (2 ** 32))
 
 
 def check_modify_and_save_config(args, configs):
@@ -192,47 +235,243 @@ def init_summarywriter(args):
     return writer
 
 
-def save_model(model, model_name, info_dict):
+def set_scheduler_step(scheduler, step):
+    scheduler.set_step(step)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        lrs = scheduler.get_lr()
+    for param_group, lr in zip(scheduler.optimizer.param_groups, lrs):
+        param_group['lr'] = lr
+    scheduler._last_lr = lrs
+
+
+def capture_rng_state():
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state()
+    return state
+
+
+def restore_rng_state(state):
+    if not state:
+        return
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+    if state.get('cuda') is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state(state['cuda'])
+
+
+def _atomic_torch_save(obj, path):
+    tmp_path = '{}.tmp.{}'.format(path, os.getpid())
+    try:
+        torch.save(obj, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _atomic_write_text(text, path):
+    tmp_path = '{}.tmp.{}'.format(path, os.getpid())
+    try:
+        with open(tmp_path, 'w') as fout:
+            fout.write(text)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as fin:
+        for chunk in iter(lambda: fin.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resume_signature(info_dict):
+    signature = {
+        key: info_dict.get(key)
+        for key in [
+            'model', 'train_engine', 'seed', 'data_seed', 'deterministic',
+            'num_workers', 'prefetch', 'accum_grad', 'use_amp', 'dtype',
+            'save_per_step', 'grad_clip', 'optim', 'optim_conf',
+            'scheduler', 'scheduler_conf', 'qwen_pretrain_path', 'onnx_path',
+        ]
+    }
+    signature.update({
+        'torch_version': str(torch.__version__),
+        'cuda_version': torch.version.cuda,
+        'cudnn_version': torch.backends.cudnn.version(),
+        'nccl_version': torch.cuda.nccl.version() if torch.cuda.is_available() else None,
+    })
+    for key in ['config', 'train_data', 'cv_data']:
+        path = info_dict.get(key)
+        if path:
+            path = os.path.abspath(path)
+            signature[key] = path
+            if os.path.isfile(path):
+                signature['{}_sha256'.format(key)] = _file_sha256(path)
+    return signature
+
+
+def training_state_path(checkpoint_path):
+    return re.sub(r'\.pt$', '.train.pt', checkpoint_path)
+
+
+def find_latest_ddp_checkpoint(model_dir):
+    latest_path = os.path.join(model_dir, 'latest_ddp')
+    if os.path.isfile(latest_path):
+        with open(latest_path, 'r') as fin:
+            checkpoint_name = fin.read().strip()
+        checkpoint_path = os.path.join(model_dir, checkpoint_name)
+        if os.path.isfile(checkpoint_path):
+            return checkpoint_path
+        logging.warning('Ignoring stale latest_ddp entry %s', checkpoint_name)
+
+    candidates = [
+        path for path in glob.glob(os.path.join(model_dir, 'epoch_*.pt'))
+        if not path.endswith('.train.pt')
+    ]
+    if not candidates:
+        raise FileNotFoundError('No resumable DDP checkpoint found in {}'.format(model_dir))
+    return max(candidates, key=os.path.getmtime)
+
+
+def resolve_ddp_resume_checkpoint(resume, model_dir):
+    if resume == 'auto':
+        return find_latest_ddp_checkpoint(model_dir)
+    if os.path.isdir(resume):
+        return find_latest_ddp_checkpoint(resume)
+    checkpoint_path = os.path.abspath(resume)
+    if checkpoint_path.endswith('.train.pt'):
+        checkpoint_path = checkpoint_path[:-len('.train.pt')] + '.pt'
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError('Resume checkpoint not found: {}'.format(checkpoint_path))
+    return checkpoint_path
+
+
+def _validate_resume_signature(saved_signature, current_info):
+    if not saved_signature:
+        logging.warning('Checkpoint has no resume signature; exact data/config alignment cannot be verified.')
+        return
+    current_signature = resume_signature(current_info)
+    mismatches = []
+    for key, saved_value in saved_signature.items():
+        current_value = current_signature.get(key)
+        if current_value != saved_value:
+            mismatches.append('{}: saved={!r}, current={!r}'.format(key, saved_value, current_value))
+    if mismatches:
+        raise RuntimeError(
+            'Resume configuration does not match the checkpoint:\n  {}'
+            .format('\n  '.join(mismatches)))
+
+
+def load_training_state(checkpoint_path, optimizer, scheduler, current_info,
+                        optimizer_d=None, scheduler_d=None, scaler=None):
+    state_path = training_state_path(checkpoint_path)
+    if not os.path.isfile(state_path):
+        logging.warning(
+            'Training state %s is missing; resuming weights, epoch, and step only. '
+            'Optimizer momentum, AMP scaler, and exact RNG continuity will be reset.',
+            state_path)
+        return {}, None
+
+    state = torch.load(state_path, map_location='cpu', weights_only=False)
+    _validate_resume_signature(state.get('resume_signature'), current_info)
+    optimizer.load_state_dict(state['optimizer'])
+    scheduler.load_state_dict(state['scheduler'])
+    if optimizer_d is not None and state.get('optimizer_d') is not None:
+        optimizer_d.load_state_dict(state['optimizer_d'])
+    if scheduler_d is not None and state.get('scheduler_d') is not None:
+        scheduler_d.load_state_dict(state['scheduler_d'])
+    if scaler is not None and state.get('scaler') is not None:
+        scaler.load_state_dict(state['scaler'])
+
+    rank = int(os.environ.get('RANK', 0))
+    rng_path = re.sub(r'\.pt$', '.rank{}.rng.pt'.format(rank), checkpoint_path)
+    if not os.path.isfile(rng_path):
+        raise RuntimeError('RNG state {} is missing; exact resume is impossible.'.format(rng_path))
+    rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+    missing_rng = [key for key in ['python', 'numpy', 'torch'] if key not in rng_state]
+    if torch.cuda.is_available() and 'cuda' not in rng_state:
+        missing_rng.append('cuda')
+    if missing_rng:
+        raise RuntimeError(
+            'RNG state {} is missing {}; this legacy checkpoint cannot be resumed exactly.'
+            .format(rng_path, ', '.join(missing_rng)))
+    return state, rng_state
+
+
+def save_model(model, model_name, info_dict, optimizer=None, scheduler=None,
+               optimizer_d=None, scheduler_d=None, scaler=None):
     rank = int(os.environ.get('RANK', 0))
     model_dir = info_dict["model_dir"]
     save_model_path = os.path.join(model_dir, '{}.pt'.format(model_name))
 
     if info_dict["train_engine"] == "torch_ddp":
         if rank == 0:
-            torch.save({**model.module.state_dict(), 'epoch': info_dict['epoch'], 'step': info_dict['step']}, save_model_path)
+            _atomic_torch_save(
+                {
+                    **model.module.state_dict(),
+                    'epoch': info_dict['epoch'],
+                    'step': info_dict['step'],
+                },
+                save_model_path)
+            if info_dict.get('save_states') == 'model+optimizer' and optimizer is not None:
+                state = {
+                    'format_version': 2,
+                    'model_checkpoint': os.path.basename(save_model_path),
+                    'epoch': info_dict['epoch'],
+                    'step': info_dict['step'],
+                    'train_batch_idx': info_dict.get('train_batch_idx', -1),
+                    'epoch_complete': info_dict.get('epoch_complete', False),
+                    'world_size': dist.get_world_size(),
+                    'resume_signature': resume_signature(info_dict),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'optimizer_d': optimizer_d.state_dict() if optimizer_d is not None else None,
+                    'scheduler_d': scheduler_d.state_dict() if scheduler_d is not None else None,
+                    'scaler': scaler.state_dict() if scaler is not None else None,
+                }
+                _atomic_torch_save(state, training_state_path(save_model_path))
+        if info_dict.get('save_states') == 'model+optimizer' and optimizer is not None:
+            rng_path = re.sub(r'\.pt$', '.rank{}.rng.pt'.format(rank), save_model_path)
+            _atomic_torch_save(capture_rng_state(), rng_path)
     else:
         with torch.no_grad():
             model.save_checkpoint(save_dir=model_dir,
                                   tag=model_name,
                                   client_state=info_dict)
+        rng_path = os.path.join(model_dir, model_name, 'rank{}.rng.pt'.format(rank))
+        _atomic_torch_save(capture_rng_state(), rng_path)
+    if dist.is_initialized():
+        dist.barrier()
     if rank == 0:
         info_path = re.sub('.pt$', '.yaml', save_model_path)
         info_dict['save_time'] = datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')
-        with open(info_path, 'w') as fout:
-            data = yaml.dump(info_dict)
-            fout.write(data)
+        _atomic_write_text(yaml.dump(info_dict), info_path)
+        if info_dict["train_engine"] == "torch_ddp" and model_name != 'init':
+            _atomic_write_text(
+                os.path.basename(save_model_path),
+                os.path.join(model_dir, 'latest_ddp'))
         logging.info('[Rank {}] Checkpoint: save to checkpoint {}'.format(rank, save_model_path))
 
 
-def cosyvoice_join(group_join, info_dict):
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    rank = int(os.environ.get('RANK', 0))
+def distributed_batch_available(has_batch, control_group):
+    """Stop all ranks at the shortest input without poisoning the process group."""
+    if dist.get_world_size() == 1:
+        return has_batch
 
-    if info_dict["batch_idx"] != 0:
-        # we try to join all rank in both ddp and deepspeed mode, in case different rank has different lr
-        try:
-            dist.monitored_barrier(group=group_join,
-                                   timeout=group_join.options._timeout)
-            return False
-        except RuntimeError as e:
-            logging.info("Detected uneven workload distribution: {}\n".format(e) +
-                         "Break current worker to manually join all workers, " +
-                         "world_size {}, current rank {}, current local_rank {}\n".
-                         format(world_size, rank, local_rank))
-            return True
-    else:
-        return False
+    available = torch.tensor(int(has_batch), dtype=torch.int32)
+    dist.all_reduce(available, op=dist.ReduceOp.MIN, group=control_group)
+    return bool(available.item())
 
 
 def batch_forward(model, batch, scaler, info_dict, ref_model=None, dpo_loss=None):
@@ -339,7 +578,14 @@ def log_per_step(writer, info_dict):
 
     # TRAIN & CV, Shell log (stdout)
     if (info_dict['batch_idx'] + 1) % info_dict['log_interval'] == 0:
-        log_str = '{} Batch {}/{} '.format(tag, epoch, batch_idx + 1)
+        completed_step = step
+        if tag == 'TRAIN':
+            if info_dict['train_engine'] == 'deepspeed':
+                completed_step += int(info_dict.get('is_gradient_accumulation_boundary', False))
+            else:
+                completed_step += int((batch_idx + 1) % info_dict['accum_grad'] == 0)
+        log_str = '{} Epoch {} Batch {} Step {} '.format(
+            tag, epoch, batch_idx + 1, completed_step)
         for name, value in loss_dict.items():
             log_str += '{} {:.6f} '.format(name, value)
         if tag == "TRAIN":
@@ -358,10 +604,12 @@ def log_per_save(writer, info_dict):
     rank = int(os.environ.get('RANK', 0))
     logging.info(
         'Epoch {} Step {} CV info lr {} {} rank {}'.format(
-            epoch, step + 1, lr, rank, ' '.join(['{} {}'.format(k, v) for k, v in loss_dict.items()])))
+            epoch, step, lr,
+            ' '.join(['{} {}'.format(k, v) for k, v in loss_dict.items()]),
+            rank))
 
     if writer is not None:
         for k in ['epoch', 'lr']:
-            writer.add_scalar('{}/{}'.format(tag, k), info_dict[k], step + 1)
+            writer.add_scalar('{}/{}'.format(tag, k), info_dict[k], step)
         for k, v in loss_dict.items():
-            writer.add_scalar('{}/{}'.format(tag, k), v, step + 1)
+            writer.add_scalar('{}/{}'.format(tag, k), v, step)

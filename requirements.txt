@@ -1,9 +1,9 @@
---extra-index-url https://download.pytorch.org/whl/cu121
---extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ # https://github.com/microsoft/onnxruntime/issues/21684
-
-# base musa image
+# Platform-specific packages are installed by the CUDA/MUSA base images or scripts.
+# CUDA examples:
+# --extra-index-url https://download.pytorch.org/whl/cu121
+# --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ # https://github.com/microsoft/onnxruntime/issues/21684
+# MUSA base image example:
 # registry.mthreads.com/public/jd-cosyvoice-training:v1.1
-
 conformer==0.3.2
 deepspeed==0.18.9; sys_platform == 'linux'
 diffusers==0.29.0
@@ -26,7 +26,7 @@ omegaconf==2.3.0
 # onnx==1.16.0
 # onnxruntime-gpu==1.18.0; sys_platform == 'linux'
 # onnxruntime==1.18.0; sys_platform == 'darwin' or sys_platform == 'win32'
-onnxruntime-musa @ https://mt-vaas-web.tos-cn-beijing.volces.com/release/ort_musa/OrtMusaV0.17.6.1/S5000/onnxruntime_musa-1.23.0+musa.0a0e92f53-cp310-cp310-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.10'
+# onnxruntime-musa @ https://mt-vaas-web.tos-cn-beijing.volces.com/release/ort_musa/OrtMusaV0.17.6.1/S5000/onnxruntime_musa-1.23.0+musa.0a0e92f53-cp310-cp310-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.10'
 openai-whisper==20250625
 protobuf==4.25
 pyarrow==18.1.0
@@ -39,8 +39,9 @@ tensorboard==2.14.0
 # tensorrt-cu12-bindings==10.13.3.9; sys_platform == 'linux'
 # tensorrt-cu12-libs==10.13.3.9; sys_platform == 'linux'
 # torch==2.3.1
-# ./torchaudio-2.7.1a0+95c61b4-cp310-cp310-linux_x86_64.whl # 本地文件，一般依赖musa镜像，如果没有请联系MT
-torchada
+# torchaudio==2.3.1
+# ./torchaudio-2.7.1a0+95c61b4-cp310-cp310-linux_x86_64.whl # local MUSA wheel if the base image does not include it
+# torchada  # required on MUSA, optional on CUDA
 transformers==4.51.3
 x-transformers==2.18.9
 uvicorn==0.30.0

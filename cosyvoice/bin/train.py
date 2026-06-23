@@ -75,7 +75,7 @@ from cosyvoice.utils.train_utils import (
     init_dataset_and_dataloader,
     init_optimizer_and_scheduler,
     init_summarywriter, load_training_state, resolve_ddp_resume_checkpoint,
-    save_model, set_scheduler_step,
+    save_model, set_global_random_seed, set_scheduler_step,
     wrap_cuda_model, check_modify_and_save_config)
 
 
@@ -118,6 +118,14 @@ def get_args():
                         default=1986,
                         type=int,
                         help='per-epoch data pipeline seed used for resumable iteration')
+    parser.add_argument('--seed',
+                        default=1986,
+                        type=int,
+                        help='model and training random seed')
+    parser.add_argument('--deterministic',
+                        action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='require deterministic PyTorch algorithms')
     parser.add_argument('--save_per_step',
                         type=int,
                         help='override train_conf.save_per_step; <= 0 disables intra-epoch checkpoints')
@@ -137,7 +145,7 @@ def get_args():
                         dest='save_states',
                         default='model_only',
                         choices=['model_only', 'model+optimizer'],
-                        help='save model only or full optimizer state; full state is required for exact DDP resume')
+                        help='save model only or full optimizer state; full state is required for exact resume')
     parser.add_argument('--timeout',
                         default=60,
                         type=int,
@@ -155,8 +163,10 @@ def main():
     os.environ['onnx_path'] = args.onnx_path
     os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
     os.environ.setdefault('RAYON_NUM_THREADS', '1')
+    set_global_random_seed(args.seed, args.deterministic)
     logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s %(levelname)s %(message)s')
+                        format='%(asctime)s %(levelname)s %(message)s',
+                        force=True)
     # gan train has some special initialization logic
     gan = True if args.model == 'hifigan' else False
 
@@ -165,6 +175,7 @@ def main():
         override_dict.pop('hift')
     if args.qwen_pretrain_path is not None:
         override_dict['qwen_pretrain_path'] = args.qwen_pretrain_path
+    override_dict['seed'] = args.seed
     with open(args.config, 'r') as f:
         configs = load_hyperpyyaml(f, overrides=override_dict)
     if gan is True:
@@ -208,6 +219,7 @@ def main():
         logging.info('No DeepSpeed checkpoint found in %s; starting a new run', args.model_dir)
         args.resume = None
         configs['train_conf']['resume'] = None
+
     model_checkpoint = resume_checkpoint
     if model_checkpoint is None and args.resume is None:
         model_checkpoint = args.checkpoint
@@ -232,10 +244,12 @@ def main():
 
     # Init scaler, used for pytorch amp mixed precision training
     scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
+    info_dict = deepcopy(configs['train_conf'])
     resume_state, resume_rng_state = {}, None
     if resume_checkpoint is not None:
         resume_state, resume_rng_state = load_training_state(
-            resume_checkpoint, optimizer, scheduler, optimizer_d, scheduler_d, scaler)
+            resume_checkpoint, optimizer, scheduler, info_dict,
+            optimizer_d=optimizer_d, scheduler_d=scheduler_d, scaler=scaler)
         start_step = resume_state.get('step', start_step)
         start_epoch = resume_state.get('epoch', start_epoch)
         if not resume_state:
@@ -251,8 +265,11 @@ def main():
             resume_path = os.path.abspath(args.resume)
             load_dir, tag = os.path.dirname(resume_path), os.path.basename(resume_path)
         load_path, client_state = model.load_checkpoint(
-            load_dir, tag=tag, load_module_strict=False,
-            load_optimizer_states=True, load_lr_scheduler_states=True)
+            load_dir,
+            tag=tag,
+            load_module_strict=False,
+            load_optimizer_states=True,
+            load_lr_scheduler_states=True)
         if load_path is None:
             raise FileNotFoundError('No DeepSpeed checkpoint found in {} tag {}'.format(load_dir, tag))
         resume_state = client_state or {}
@@ -260,8 +277,9 @@ def main():
         start_epoch = resume_state.get('epoch', -1)
         rank = int(os.environ.get('RANK', 0))
         rng_path = os.path.join(os.path.dirname(load_path), 'rank{}.rng.pt'.format(rank))
-        if os.path.isfile(rng_path):
-            resume_rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+        if not os.path.isfile(rng_path):
+            raise RuntimeError('RNG state {} is missing; exact resume is impossible.'.format(rng_path))
+        resume_rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
         logging.info('Resuming DeepSpeed training from %s', load_path)
     else:
         set_scheduler_step(scheduler, start_step)
@@ -269,18 +287,18 @@ def main():
             set_scheduler_step(scheduler_d, start_step)
 
     # Save init checkpoints
-    info_dict = deepcopy(configs['train_conf'])
     info_dict['step'] = start_step
     info_dict['epoch'] = start_epoch
     info_dict['epoch_complete'] = True
     if args.resume is None:
-        save_model(model, 'init', info_dict, optimizer, scheduler,
-                   optimizer_d=optimizer_d, scheduler_d=scheduler_d, scaler=scaler)
+        save_model(
+            model, 'init', info_dict, optimizer, scheduler,
+            optimizer_d=optimizer_d, scheduler_d=scheduler_d, scaler=scaler)
 
     # DPO related
     if args.dpo is True:
         ref_model = deepcopy(configs[args.model])
-        state_dict = torch.load(args.ref_model, map_location='cpu')
+        state_dict = torch.load(args.ref_model, map_location='cpu', weights_only=False)
         ref_model.load_state_dict(state_dict, strict=False)
         dpo_loss = DPOLoss(beta=0.01, label_smoothing=0.0, ipo=False)
         # NOTE maybe it is not needed to wrap ref_model as ddp because its parameter is not updated
@@ -303,9 +321,9 @@ def main():
         raise RuntimeError(
             'Legacy intra-epoch checkpoint {} has no .train.pt state and cannot be resumed safely. '
             'Use an epoch_*_whole.pt checkpoint instead.'.format(resume_checkpoint))
-    if not epoch_complete and resume_state.get('world_size', dist.get_world_size()) != dist.get_world_size():
+    if resume_state and resume_state.get('world_size', dist.get_world_size()) != dist.get_world_size():
         raise RuntimeError(
-            'Intra-epoch resume requires the original world size {}, but current world size is {}.'
+            'Exact resume requires world size {}, but the current world size is {}.'
             .format(resume_state['world_size'], dist.get_world_size()))
     first_epoch = start_epoch + 1 if epoch_complete else start_epoch
     resume_batch_idx = 0 if epoch_complete else resume_state.get('train_batch_idx', -1) + 1

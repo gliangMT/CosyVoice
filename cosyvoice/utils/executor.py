@@ -84,12 +84,8 @@ class Executor:
             info_dict["batch_idx"] = batch_idx
 
             # Disable gradient synchronizations across DDP processes.
-            # Within this context, gradients will be accumulated on module
-            # variables, which will later be synchronized.
             if info_dict['train_engine'] == 'torch_ddp' and (batch_idx + 1) % info_dict["accum_grad"] != 0:
                 context = model.no_sync
-            # Used for single gpu training and DDP gradient synchronization
-            # processes.
             else:
                 context = nullcontext
 
@@ -106,20 +102,22 @@ class Executor:
                (batch_idx + 1) % info_dict["accum_grad"] == 0:
                 dist.barrier()
                 info_dict['train_batch_idx'] = batch_idx
-                self.cv(model, optimizer, scheduler, cv_data_loader, writer, info_dict, scaler,
-                        on_batch_end=False)
+                self.cv(
+                    model, optimizer, scheduler, cv_data_loader, writer,
+                    info_dict, scaler, on_batch_end=False)
                 model.train()
             batch_idx += 1
-        # Some ranks stop before exhausting their iterator. Releasing it here
-        # shuts down prefetched training workers before CV workers are created.
+        # Longer ranks may still own prefetched batches; release their workers before CV.
         del data_iter
         dist.barrier()
         info_dict['train_batch_idx'] = batch_idx - 1
-        self.cv(model, optimizer, scheduler, cv_data_loader, writer, info_dict, scaler,
-                on_batch_end=True)
+        self.cv(
+            model, optimizer, scheduler, cv_data_loader, writer,
+            info_dict, scaler, on_batch_end=True)
 
     def train_one_epoc_gan(self, model, optimizer, scheduler, optimizer_d, scheduler_d, train_data_loader, cv_data_loader,
-                           writer, info_dict, scaler, control_group, resume_batch_idx=0, resume_rng_state=None):
+                           writer, info_dict, scaler, control_group,
+                           resume_batch_idx=0, resume_rng_state=None):
         ''' Train one epoch
         '''
 
@@ -156,12 +154,8 @@ class Executor:
             info_dict["batch_idx"] = batch_idx
 
             # Disable gradient synchronizations across DDP processes.
-            # Within this context, gradients will be accumulated on module
-            # variables, which will later be synchronized.
             if info_dict['train_engine'] == 'torch_ddp' and (batch_idx + 1) % info_dict["accum_grad"] != 0:
                 context = model.no_sync
-            # Used for single gpu training and DDP gradient synchronization
-            # processes.
             else:
                 context = nullcontext
 
@@ -186,24 +180,28 @@ class Executor:
                (batch_idx + 1) % info_dict["accum_grad"] == 0:
                 dist.barrier()
                 info_dict['train_batch_idx'] = batch_idx
-                self.cv(model, optimizer, scheduler, cv_data_loader, writer, info_dict, scaler,
-                        optimizer_d=optimizer_d, scheduler_d=scheduler_d, on_batch_end=False)
+                self.cv(
+                    model, optimizer, scheduler, cv_data_loader, writer,
+                    info_dict, scaler, optimizer_d=optimizer_d,
+                    scheduler_d=scheduler_d, on_batch_end=False)
                 model.train()
             batch_idx += 1
-        # Some ranks stop before exhausting their iterator. Releasing it here
-        # shuts down prefetched training workers before CV workers are created.
+        # Longer ranks may still own prefetched batches; release their workers before CV.
         del data_iter
         dist.barrier()
         info_dict['train_batch_idx'] = batch_idx - 1
-        self.cv(model, optimizer, scheduler, cv_data_loader, writer, info_dict, scaler,
-                optimizer_d=optimizer_d, scheduler_d=scheduler_d, on_batch_end=True)
+        self.cv(
+            model, optimizer, scheduler, cv_data_loader, writer,
+            info_dict, scaler, optimizer_d=optimizer_d,
+            scheduler_d=scheduler_d, on_batch_end=True)
 
     @torch.inference_mode()
     def cv(self, model, optimizer, scheduler, cv_data_loader, writer, info_dict, scaler,
            optimizer_d=None, scheduler_d=None, on_batch_end=True):
         ''' Cross validation on
         '''
-        logging.info('Epoch {} Step {} on_batch_end {} CV rank {}'.format(self.epoch, self.step, on_batch_end, self.rank))
+        logging.info('Epoch {} Step {} on_batch_end {} CV rank {}'.format(
+            self.epoch, self.step, on_batch_end, self.rank))
         model.eval()
         seed_dataloader_for_epoch(cv_data_loader, self.epoch, info_dict['data_seed'] + 10000000)
         total_num_utts, total_loss_dict = 0, {}  # avoid division by 0
@@ -232,10 +230,14 @@ class Executor:
         info_dict['epoch_complete'] = on_batch_end
         info_dict['world_size'] = dist.get_world_size()
         log_per_save(writer, info_dict)
-        model_name = 'epoch_{}_whole'.format(self.epoch) if on_batch_end else 'epoch_{}_step_{}'.format(self.epoch, self.step)
-        save_model(model, model_name, info_dict, optimizer, scheduler,
-                   optimizer_d=optimizer_d, scheduler_d=scheduler_d, scaler=scaler)
-        dist.barrier()
+        model_name = (
+            'epoch_{}_whole'.format(self.epoch)
+            if on_batch_end
+            else 'epoch_{}_step_{}'.format(self.epoch, self.step)
+        )
+        save_model(
+            model, model_name, info_dict, optimizer, scheduler,
+            optimizer_d=optimizer_d, scheduler_d=scheduler_d, scaler=scaler)
 
     @staticmethod
     def _skip_batches(data_iter, resume_batch_idx, control_group):

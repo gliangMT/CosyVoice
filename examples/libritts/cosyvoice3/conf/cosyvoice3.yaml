@@ -1,8 +1,9 @@
 # set random seed, so that you may reproduce your result.
-__set_seed1: !apply:random.seed [1986]
-__set_seed2: !apply:numpy.random.seed [1986]
-__set_seed3: !apply:torch.manual_seed [1986]
-__set_seed4: !apply:torch.cuda.manual_seed_all [1986]
+seed: 1986
+__set_seed1: !apply:random.seed [!ref <seed>]
+__set_seed2: !apply:numpy.random.seed [!ref <seed>]
+__set_seed3: !apply:torch.manual_seed [!ref <seed>]
+__set_seed4: !apply:torch.cuda.manual_seed_all [!ref <seed>]
 
 # fixed params
 sample_rate: 24000
@@ -196,7 +197,7 @@ data_pipeline_gan: [
     !ref <padding>,
 ]
 
-# llm flow train conf -sft
+# llm flow train conf - sft
 # train_conf:
 #     optim: adam
 #     optim_conf:
@@ -237,6 +238,20 @@ train_conf:
     accum_grad: 2
     log_interval: 100
     save_per_step: -1
+
+# flow train conf - from scratch
+# train_conf:
+#     optim: adamw
+#     optim_conf:
+#         lr: 1e-4
+#     scheduler: warmuplr
+#     scheduler_conf:
+#         warmup_steps: 10000
+#     max_epoch: 50
+#     grad_clip: 1
+#     accum_grad: 2
+#     log_interval: 100
+#     save_per_step: -1
 
 # gan train conf
 train_conf_gan:

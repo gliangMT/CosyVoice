@@ -17,6 +17,7 @@
 import logging
 import os
 import glob
+import hashlib
 import random
 import torch
 import json
@@ -45,6 +46,24 @@ def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % (2 ** 32)
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+
+
+def set_global_random_seed(seed, deterministic=True):
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        if hasattr(torch, 'musa') and torch.musa.is_available():
+            torch.musa.manual_seed_all(seed)
+        elif torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception as ex:
+        logging.warning('Failed to seed accelerator RNG: %s', ex)
+    if hasattr(torch.backends, 'cudnn'):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = deterministic
+    torch.use_deterministic_algorithms(deterministic)
 
 
 def init_distributed(args):
@@ -88,6 +107,16 @@ def init_dataset_and_dataloader(args, configs, gan, dpo):
                                 generator=cv_generator,
                                 **loader_kwargs)
     return train_dataset, cv_dataset, train_data_loader, cv_data_loader
+
+
+def seed_dataloader_for_epoch(data_loader, epoch, data_seed):
+    rank = int(os.environ.get('RANK', 0))
+    epoch_seed = data_seed + epoch * 100000 + rank
+    if data_loader.generator is not None:
+        data_loader.generator.manual_seed(epoch_seed)
+    if data_loader.num_workers == 0:
+        random.seed(epoch_seed)
+        np.random.seed(epoch_seed % (2 ** 32))
 
 
 def check_modify_and_save_config(args, configs):
@@ -223,18 +252,12 @@ def set_scheduler_step(scheduler, step):
     scheduler._last_lr = lrs
 
 
-def seed_dataloader_for_epoch(data_loader, epoch, data_seed):
-    rank = int(os.environ.get('RANK', 0))
-    epoch_seed = data_seed + epoch * 100000 + rank
-    if data_loader.generator is not None:
-        data_loader.generator.manual_seed(epoch_seed)
-    if data_loader.num_workers == 0:
-        random.seed(epoch_seed)
-        np.random.seed(epoch_seed % (2 ** 32))
-
-
 def capture_rng_state():
-    state = {'torch': torch.get_rng_state()}
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
     try:
         if hasattr(torch, 'musa') and torch.musa.is_available():
             state['accelerator'] = torch.musa.get_rng_state()
@@ -250,12 +273,18 @@ def capture_rng_state():
 def restore_rng_state(state):
     if not state:
         return
+    if 'python' in state:
+        random.setstate(state['python'])
+    if 'numpy' in state:
+        np.random.set_state(state['numpy'])
     torch.set_rng_state(state['torch'])
     try:
         if state.get('accelerator_type') == 'musa':
             torch.musa.set_rng_state(state['accelerator'])
         elif state.get('accelerator_type') == 'cuda':
             torch.cuda.set_rng_state(state['accelerator'])
+        elif state.get('cuda') is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(state['cuda'])
     except Exception as ex:
         logging.warning('Failed to restore accelerator RNG state: %s', ex)
 
@@ -279,6 +308,55 @@ def _atomic_write_text(text, path):
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as fin:
+        for chunk in iter(lambda: fin.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _accelerator_signature():
+    if hasattr(torch, 'musa') and torch.musa.is_available():
+        return {
+            'accelerator': 'musa',
+            'torch_musa_version': getattr(torch.version, 'musa', None),
+        }
+    signature = {
+        'accelerator': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'cuda_version': torch.version.cuda,
+    }
+    if hasattr(torch.backends, 'cudnn'):
+        signature['cudnn_version'] = torch.backends.cudnn.version()
+    try:
+        signature['nccl_version'] = torch.cuda.nccl.version() if torch.cuda.is_available() else None
+    except Exception:
+        signature['nccl_version'] = None
+    return signature
+
+
+def resume_signature(info_dict):
+    signature = {
+        key: info_dict.get(key)
+        for key in [
+            'model', 'train_engine', 'seed', 'data_seed', 'deterministic',
+            'num_workers', 'prefetch', 'accum_grad', 'use_amp', 'dtype',
+            'save_per_step', 'grad_clip', 'optim', 'optim_conf',
+            'scheduler', 'scheduler_conf', 'qwen_pretrain_path', 'onnx_path',
+        ]
+    }
+    signature['torch_version'] = str(torch.__version__)
+    signature.update(_accelerator_signature())
+    for key in ['config', 'train_data', 'cv_data']:
+        path = info_dict.get(key)
+        if path:
+            path = os.path.abspath(path)
+            signature[key] = path
+            if os.path.isfile(path):
+                signature['{}_sha256'.format(key)] = _file_sha256(path)
+    return signature
 
 
 def training_state_path(checkpoint_path):
@@ -317,16 +395,34 @@ def resolve_ddp_resume_checkpoint(resume, model_dir):
     return checkpoint_path
 
 
-def load_training_state(checkpoint_path, optimizer, scheduler,
+def _validate_resume_signature(saved_signature, current_info):
+    if not saved_signature:
+        logging.warning('Checkpoint has no resume signature; exact data/config alignment cannot be verified.')
+        return
+    current_signature = resume_signature(current_info)
+    mismatches = []
+    for key, saved_value in saved_signature.items():
+        current_value = current_signature.get(key)
+        if current_value != saved_value:
+            mismatches.append('{}: saved={!r}, current={!r}'.format(key, saved_value, current_value))
+    if mismatches:
+        raise RuntimeError(
+            'Resume configuration does not match the checkpoint:\n  {}'
+            .format('\n  '.join(mismatches)))
+
+
+def load_training_state(checkpoint_path, optimizer, scheduler, current_info,
                         optimizer_d=None, scheduler_d=None, scaler=None):
     state_path = training_state_path(checkpoint_path)
     if not os.path.isfile(state_path):
         logging.warning(
             'Training state %s is missing; resuming weights, epoch, and step only. '
-            'Optimizer momentum and AMP scaler will be reset.', state_path)
+            'Optimizer momentum, AMP scaler, and exact RNG continuity will be reset.',
+            state_path)
         return {}, None
 
     state = torch.load(state_path, map_location='cpu', weights_only=False)
+    _validate_resume_signature(state.get('resume_signature'), current_info)
     optimizer.load_state_dict(state['optimizer'])
     scheduler.load_state_dict(state['scheduler'])
     if optimizer_d is not None and state.get('optimizer_d') is not None:
@@ -338,11 +434,16 @@ def load_training_state(checkpoint_path, optimizer, scheduler,
 
     rank = int(os.environ.get('RANK', 0))
     rng_path = re.sub(r'\.pt$', '.rank{}.rng.pt'.format(rank), checkpoint_path)
-    rng_state = None
-    if os.path.isfile(rng_path):
-        rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
-    else:
-        logging.warning('RNG state %s is missing; resume will not be bit-exact.', rng_path)
+    if not os.path.isfile(rng_path):
+        raise RuntimeError('RNG state {} is missing; exact resume is impossible.'.format(rng_path))
+    rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+    missing_rng = [key for key in ['python', 'numpy', 'torch'] if key not in rng_state]
+    if is_gpu_available() and 'accelerator' not in rng_state and 'cuda' not in rng_state:
+        missing_rng.append('accelerator')
+    if missing_rng:
+        raise RuntimeError(
+            'RNG state {} is missing {}; this legacy checkpoint cannot be resumed exactly.'
+            .format(rng_path, ', '.join(missing_rng)))
     return state, rng_state
 
 
@@ -355,19 +456,22 @@ def save_model(model, model_name, info_dict, optimizer=None, scheduler=None,
     if info_dict["train_engine"] == "torch_ddp":
         if rank == 0:
             _atomic_torch_save(
-                {**model.module.state_dict(),
-                 'epoch': info_dict['epoch'],
-                 'step': info_dict['step']},
+                {
+                    **model.module.state_dict(),
+                    'epoch': info_dict['epoch'],
+                    'step': info_dict['step'],
+                },
                 save_model_path)
             if info_dict.get('save_states') == 'model+optimizer' and optimizer is not None:
                 state = {
-                    'format_version': 1,
+                    'format_version': 2,
                     'model_checkpoint': os.path.basename(save_model_path),
                     'epoch': info_dict['epoch'],
                     'step': info_dict['step'],
                     'train_batch_idx': info_dict.get('train_batch_idx', -1),
                     'epoch_complete': info_dict.get('epoch_complete', False),
                     'world_size': dist.get_world_size(),
+                    'resume_signature': resume_signature(info_dict),
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'optimizer_d': optimizer_d.state_dict() if optimizer_d is not None else None,
@@ -385,13 +489,16 @@ def save_model(model, model_name, info_dict, optimizer=None, scheduler=None,
                                   client_state=info_dict)
         rng_path = os.path.join(model_dir, model_name, 'rank{}.rng.pt'.format(rank))
         _atomic_torch_save(capture_rng_state(), rng_path)
+    if dist.is_initialized():
+        dist.barrier()
     if rank == 0:
         info_path = re.sub('.pt$', '.yaml', save_model_path)
         info_dict['save_time'] = datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')
         _atomic_write_text(yaml.dump(info_dict), info_path)
         if info_dict["train_engine"] == "torch_ddp" and model_name != 'init':
-            _atomic_write_text(os.path.basename(save_model_path),
-                               os.path.join(model_dir, 'latest_ddp'))
+            _atomic_write_text(
+                os.path.basename(save_model_path),
+                os.path.join(model_dir, 'latest_ddp'))
         logging.info('[Rank {}] Checkpoint: save to checkpoint {}'.format(rank, save_model_path))
 
 
@@ -535,7 +642,9 @@ def log_per_save(writer, info_dict):
     rank = int(os.environ.get('RANK', 0))
     logging.info(
         'Epoch {} Step {} CV info lr {} {} rank {}'.format(
-            epoch, step, lr, ' '.join(['{} {}'.format(k, v) for k, v in loss_dict.items()]), rank))
+            epoch, step, lr,
+            ' '.join(['{} {}'.format(k, v) for k, v in loss_dict.items()]),
+            rank))
 
     if writer is not None:
         for k in ['epoch', 'lr']:

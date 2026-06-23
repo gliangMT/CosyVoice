@@ -19,8 +19,48 @@ import logging
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 from copy import deepcopy
 import os
+import warnings
+
+
+_root_logger = logging.getLogger()
+_root_logging_handlers = list(_root_logger.handlers)
+_root_logging_level = _root_logger.level
+
+
+def restore_root_logging():
+    for handler in list(_root_logger.handlers):
+        _root_logger.removeHandler(handler)
+    for handler in _root_logging_handlers:
+        _root_logger.addHandler(handler)
+    _root_logger.setLevel(_root_logging_level)
+
+
+def is_musa_environment():
+    accelerator_backend = os.environ.get('ACCELERATOR_BACKEND', '').lower()
+    if accelerator_backend == 'musa':
+        return True
+    if accelerator_backend == 'cuda':
+        return False
+    musa_visible_devices = os.environ.get('MUSA_VISIBLE_DEVICES')
+    return musa_visible_devices not in (None, '', '-1')
+
+
+try:
+    import torchada  # noqa: F401 - must patch accelerator APIs before importing torch
+except ImportError as ex:
+    if is_musa_environment():
+        raise RuntimeError(
+            'torchada is required for CosyVoice training on MUSA. '
+            'Install torchada before launching cosyvoice/bin/train.py.'
+        ) from ex
+    warnings.warn(
+        'torchada is not available; continuing without torchada because this '
+        'does not look like a MUSA training environment.',
+        RuntimeWarning,
+    )
+else:
+    restore_root_logging()
 import torch
-import musa_patch
 import torch.distributed as dist
 import deepspeed
 

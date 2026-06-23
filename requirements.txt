@@ -40,7 +40,7 @@ tensorboard==2.14.0
 # tensorrt-cu12-libs==10.13.3.9; sys_platform == 'linux'
 # torch==2.3.1
 # ./torchaudio-2.7.1a0+95c61b4-cp310-cp310-linux_x86_64.whl # 本地文件，一般依赖musa镜像，如果没有请联系MT
-torchada==0.1.59
+torchada
 transformers==4.51.3
 x-transformers==2.18.9
 uvicorn==0.30.0

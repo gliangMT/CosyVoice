@@ -114,7 +114,7 @@ export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
 
 num_gpus="$(awk -F, '{print NF}' <<< "${MUSA_VISIBLE_DEVICES}")"
 job_id="${job_id:-1986}"
-dist_backend="${dist_backend:-mccl}"
+dist_backend="${dist_backend:-nccl}"
 num_workers="${num_workers:-2}"
 prefetch="${prefetch:-100}"
 train_engine="${train_engine:-torch_ddp}"
@@ -165,7 +165,7 @@ if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
       --use_amp \
       --deepspeed_config ./conf/ds_stage2.json \
       --resume auto \
-      --save_per_step 1000 \
+      --save_per_step 16000 \
       --deepspeed.save_states model+optimizer \
       "$@" 2>&1 | tee "${log_file}"
   done

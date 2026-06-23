@@ -37,6 +37,7 @@ from torch.nn.utils import clip_grad_norm_
 from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem_needs_all_live
 
 from cosyvoice.dataset.dataset import Dataset
+from cosyvoice.utils.device import is_gpu_available
 from cosyvoice.utils.scheduler import WarmupLR, NoamHoldAnnealing, ConstantLR
 
 
@@ -115,8 +116,8 @@ def wrap_cuda_model(args, model):
     local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', 1))
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     if args.train_engine == "torch_ddp":  # native pytorch ddp
-        assert (torch.cuda.is_available())
-        model.musa()
+        assert is_gpu_available(), 'torch_ddp training requires a CUDA or MUSA accelerator'
+        model.cuda()
         model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
     else:
         if int(os.environ.get('RANK', 0)) == 0:

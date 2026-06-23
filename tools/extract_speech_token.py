@@ -15,12 +15,15 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import os
 import torch
 from tqdm import tqdm
 import onnxruntime
 import numpy as np
 import torchaudio
 import whisper
+
+from cosyvoice.utils.onnx import get_speech_tokenizer_providers
 
 
 def single_job(utt):
@@ -65,7 +68,7 @@ if __name__ == "__main__":
     option = onnxruntime.SessionOptions()
     option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
     option.intra_op_num_threads = 1
-    providers = ["CUDAExecutionProvider"]
+    providers = get_speech_tokenizer_providers(int(os.environ.get("LOCAL_RANK", 0)))
     ort_session = onnxruntime.InferenceSession(args.onnx_path, sess_options=option, providers=providers)
     executor = ThreadPoolExecutor(max_workers=args.num_thread)
 

@@ -13,8 +13,12 @@ def get_speech_tokenizer_providers(device_id):
         if 'MUSAExecutionProvider' not in available_providers:
             raise RuntimeError('MUSAExecutionProvider is not available')
         return [('MUSAExecutionProvider', {'device_id': device_id}), 'CPUExecutionProvider']
+    if requested_provider == 'cuda':
+        if 'CUDAExecutionProvider' not in available_providers:
+            raise RuntimeError('CUDAExecutionProvider is not available')
+        return [('CUDAExecutionProvider', {'device_id': device_id}), 'CPUExecutionProvider']
     if requested_provider not in ('auto', ''):
-        raise ValueError('COSYVOICE_ONNX_PROVIDER must be cpu, musa, or auto')
+        raise ValueError('COSYVOICE_ONNX_PROVIDER must be cpu, cuda, musa, or auto')
     if 'MUSAExecutionProvider' in available_providers:
         return [('MUSAExecutionProvider', {'device_id': device_id}), 'CPUExecutionProvider']
     elif 'CUDAExecutionProvider' in available_providers:

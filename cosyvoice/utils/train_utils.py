@@ -441,9 +441,13 @@ def load_training_state(checkpoint_path, optimizer, scheduler, current_info,
     if is_gpu_available() and 'accelerator' not in rng_state and 'cuda' not in rng_state:
         missing_rng.append('accelerator')
     if missing_rng:
-        raise RuntimeError(
-            'RNG state {} is missing {}; this legacy checkpoint cannot be resumed exactly.'
-            .format(rng_path, ', '.join(missing_rng)))
+        if state.get('format_version', 0) >= 2:
+            raise RuntimeError(
+                'RNG state {} is missing {}; exact resume is impossible.'
+                .format(rng_path, ', '.join(missing_rng)))
+        logging.warning(
+            'RNG state %s is missing %s; resuming legacy checkpoint without bit-exact RNG continuity.',
+            rng_path, ', '.join(missing_rng))
     return state, rng_state
 
 

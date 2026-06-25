@@ -131,6 +131,11 @@ def get_args():
                         action=argparse.BooleanOptionalAction,
                         default=True,
                         help='require deterministic PyTorch algorithms')
+    parser.add_argument('--rng_alignment_max_speech_feat_numel',
+                        default=0,
+                        type=int,
+                        help='skip complete gradient-accumulation windows when any rank has a larger speech_feat tensor; '
+                             '0 disables the CUDA/MUSA RNG alignment guard')
     parser.add_argument('--save_per_step',
                         type=int,
                         help='override train_conf.save_per_step; <= 0 disables intra-epoch checkpoints')

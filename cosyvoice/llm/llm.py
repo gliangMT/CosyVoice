@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import os, queue
 import random
 import time
@@ -224,9 +225,12 @@ class TransformerLM(torch.nn.Module):
 
 
 class Qwen2Encoder(torch.nn.Module):
-    def __init__(self, pretrain_path):
+    def __init__(self, pretrain_path, attn_implementation='sdpa'):
         super().__init__()
-        self.model = Qwen2ForCausalLM.from_pretrained(pretrain_path)
+        self.model = Qwen2ForCausalLM.from_pretrained(
+            pretrain_path,
+            attn_implementation=attn_implementation,
+        )
 
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor):
         T = xs.size(1)
@@ -265,6 +269,8 @@ class Qwen2LM(TransformerLM):
             length_normalized_loss: bool = True,
             lsm_weight: float = 0.0,
             mix_ratio: List[int] = [5, 15],
+            bistream_mode: str = 'random',
+            bistream_seed: int = 1986,
     ):
         torch.nn.Module.__init__(self)
         self.llm_input_size = llm_input_size
@@ -292,6 +298,10 @@ class Qwen2LM(TransformerLM):
         # 4. sampling method
         self.sampling = sampling
         self.mix_ratio = mix_ratio
+        if bistream_mode not in ('random', 'deterministic'):
+            raise ValueError(f'unsupported bistream_mode {bistream_mode}')
+        self.bistream_mode = bistream_mode
+        self.bistream_seed = bistream_seed
 
         # 5. vllm related
         self.stop_token_ids = [speech_token_size + i for i in range(3)]
@@ -299,7 +309,18 @@ class Qwen2LM(TransformerLM):
         if online_feature is True:
             self.speech_token_extractor = SpeechTokenExtractor(model_path=os.path.join(onnx_path, 'speech_tokenizer_v2.batch.onnx'))
 
-    def prepare_lm_input_target(self, sos_emb, text_token, text_token_emb, text_token_len, task_id_emb, speech_token, speech_token_emb, speech_token_len, instruct_token=None, instruct_token_emb=None, instruct_token_len=None):
+    def _use_bistream(self, utt, epoch):
+        if self.bistream_mode == 'random':
+            return random.random() < 0.5
+        digest = hashlib.blake2b(
+            f'{self.bistream_seed}:{epoch}:{utt}'.encode('utf-8'),
+            digest_size=8,
+        ).digest()
+        return int.from_bytes(digest, byteorder='little') < (1 << 63)
+
+    def prepare_lm_input_target(self, sos_emb, text_token, text_token_emb, text_token_len, task_id_emb,
+                                speech_token, speech_token_emb, speech_token_len, instruct_token=None,
+                                instruct_token_emb=None, instruct_token_len=None, utts=None, epoch=0):
         lm_target, lm_input = [], []
         text_token = unpad_sequence(text_token, text_token_len.cpu(), batch_first=True)
         speech_token = unpad_sequence(speech_token, speech_token_len.cpu(), batch_first=True)
@@ -313,9 +334,13 @@ class Qwen2LM(TransformerLM):
             instruct_token = [torch.empty(0).to(text_token[0])] * len(text_token)
             instruct_token_emb = [torch.empty(0, 896).to(text_token_emb[0])] * len(text_token)
             instruct_token_len = torch.zeros(len(text_token)).to(text_token_len)
+        if self.bistream_mode == 'deterministic' and (utts is None or len(utts) != len(text_token)):
+            raise ValueError(
+                'deterministic bistream mode requires one utterance id per LLM input')
         for i in range(len(text_token)):
+            utt = utts[i] if utts is not None else i
             # bistream sequence
-            if random.random() < 0.5 and speech_token_len[i] / text_token_len[i] > self.mix_ratio[1] / self.mix_ratio[0]:
+            if self._use_bistream(utt, epoch) and speech_token_len[i] / text_token_len[i] > self.mix_ratio[1] / self.mix_ratio[0]:
                 this_lm_target, this_lm_input = [IGNORE_ID], [sos_emb.squeeze(dim=0)]
                 this_lm_target += [IGNORE_ID] * instruct_token_len[i]
                 this_lm_input.append(instruct_token_emb[i])
@@ -389,10 +414,12 @@ class Qwen2LM(TransformerLM):
             instruct_token_len = batch['instruct_token_len'].to(device)
             instruct_token_emb = self.llm.model.model.embed_tokens(instruct_token)
             lm_target, lm_input, lm_input_len = self.prepare_lm_input_target(sos_emb, text_token, text_token_emb, text_token_len, task_id_emb,
-                                                                             speech_token, speech_token_emb, speech_token_len, instruct_token, instruct_token_emb, instruct_token_len)
+                                                                             speech_token, speech_token_emb, speech_token_len, instruct_token, instruct_token_emb, instruct_token_len,
+                                                                             utts=batch.get('utts'), epoch=batch.get('_epoch', 0))
         elif self.__class__.__name__ == 'Qwen2LM':
             lm_target, lm_input, lm_input_len = self.prepare_lm_input_target(sos_emb, text_token, text_token_emb, text_token_len, task_id_emb,
-                                                                             speech_token, speech_token_emb, speech_token_len)
+                                                                             speech_token, speech_token_emb, speech_token_len,
+                                                                             utts=batch.get('utts'), epoch=batch.get('_epoch', 0))
         else:
             raise ValueError
         lm_target = lm_target.to(device)
@@ -432,8 +459,12 @@ class Qwen2LM(TransformerLM):
         speech_token_combined_emb = self.speech_embedding(speech_token_combined)
 
         # 3. prepare llm_input/target
+        utts = batch.get('utts')
+        if utts is not None:
+            utts = utts + utts
         lm_target, lm_input, lm_input_len = self.prepare_lm_input_target(sos_emb, text_token.repeat(2, 1), text_token_emb.repeat(2, 1, 1), text_token_len.repeat(2),
-                                                                         task_id_emb, speech_token_combined, speech_token_combined_emb, speech_token_combined_len)
+                                                                         task_id_emb, speech_token_combined, speech_token_combined_emb, speech_token_combined_len,
+                                                                         utts=utts, epoch=batch.get('_epoch', 0))
         lm_target = lm_target.to(device)
 
         # 4. run lm forward
@@ -672,6 +703,8 @@ class CosyVoice3LM(Qwen2LM):
             length_normalized_loss: bool = True,
             lsm_weight: float = 0.0,
             mix_ratio: List[int] = [5, 15],
+            bistream_mode: str = 'random',
+            bistream_seed: int = 1986,
     ):
         torch.nn.Module.__init__(self)
         self.llm_input_size = llm_input_size
@@ -698,6 +731,10 @@ class CosyVoice3LM(Qwen2LM):
         # 4. sampling method
         self.sampling = sampling
         self.mix_ratio = mix_ratio
+        if bistream_mode not in ('random', 'deterministic'):
+            raise ValueError(f'unsupported bistream_mode {bistream_mode}')
+        self.bistream_mode = bistream_mode
+        self.bistream_seed = bistream_seed
 
         # 5. vllm related
         self.stop_token_ids = [speech_token_size + i for i in range(200)]

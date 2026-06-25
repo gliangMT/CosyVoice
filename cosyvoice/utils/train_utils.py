@@ -124,6 +124,10 @@ def seed_dataloader_for_epoch(data_loader, epoch, data_seed):
 
 
 def check_modify_and_save_config(args, configs):
+    if args.rng_alignment_max_speech_feat_numel > 0 and args.train_engine != 'torch_ddp':
+        raise ValueError(
+            '--rng_alignment_max_speech_feat_numel currently supports torch_ddp only, '
+            'because an oversized batch discards the complete accumulation window.')
     if args.train_engine == "torch_ddp":
         configs['train_conf']["dtype"] = 'bf16' if args.use_amp is True else 'fp32'
     else:
@@ -421,7 +425,7 @@ def resume_signature(info_dict):
             'num_workers', 'prefetch', 'accum_grad', 'use_amp', 'dtype',
             'save_per_step', 'grad_clip', 'optim', 'optim_conf',
             'scheduler', 'scheduler_conf', 'qwen_pretrain_path', 'onnx_path',
-            'dist_backend',
+            'dist_backend', 'rng_alignment_max_speech_feat_numel',
         ]
     }
     signature['signature_version'] = 2
@@ -731,8 +735,26 @@ def distributed_batch_available(has_batch, control_group):
     return bool(available.item())
 
 
+def distributed_rng_alignment_limit_exceeded(batch, max_speech_feat_numel, control_group):
+    """Return whether any rank would launch an oversized speech-feature RNG kernel."""
+    if max_speech_feat_numel <= 0:
+        return False
+
+    speech_feat = batch.get('speech_feat') if batch is not None else None
+    local_exceeded = int(
+        torch.is_tensor(speech_feat) and speech_feat.numel() > max_speech_feat_numel
+    )
+    if dist.get_world_size() == 1:
+        return bool(local_exceeded)
+
+    exceeded = torch.tensor(local_exceeded, dtype=torch.int32)
+    dist.all_reduce(exceeded, op=dist.ReduceOp.MAX, group=control_group)
+    return bool(exceeded.item())
+
+
 def batch_forward(model, batch, scaler, info_dict, ref_model=None, dpo_loss=None):
     device = int(os.environ.get('LOCAL_RANK', 0))
+    batch['_epoch'] = info_dict.get('epoch', 0)
 
     dtype = info_dict["dtype"]
     if dtype == "fp16":

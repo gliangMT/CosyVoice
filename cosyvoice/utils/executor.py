@@ -25,6 +25,7 @@ from cosyvoice.utils.train_utils import (
     batch_backward,
     batch_forward,
     distributed_batch_available,
+    distributed_rng_alignment_limit_exceeded,
     log_per_save,
     log_per_step,
     restore_rng_state,
@@ -61,6 +62,7 @@ class Executor:
         data_iter = iter(train_data_loader)
         batch_idx = self._skip_batches(data_iter, resume_batch_idx, control_group)
         restore_rng_state(resume_rng_state)
+        skip_accumulation_window = False
         while True:
             try:
                 batch_dict = next(data_iter)
@@ -83,6 +85,23 @@ class Executor:
             info_dict["epoch"] = self.epoch
             info_dict["batch_idx"] = batch_idx
 
+            rng_alignment_limit = info_dict.get('rng_alignment_max_speech_feat_numel', 0)
+            if distributed_rng_alignment_limit_exceeded(
+                    batch_dict, rng_alignment_limit, control_group):
+                skip_accumulation_window = True
+                logging.warning(
+                    'Epoch %s batch %s exceeds CUDA/MUSA RNG alignment limit %s; '
+                    'discarding this gradient-accumulation window on rank %s '
+                    '(local speech_feat.numel=%s)',
+                    self.epoch, batch_idx, rng_alignment_limit, self.rank,
+                    batch_dict['speech_feat'].numel())
+            if skip_accumulation_window:
+                optimizer.zero_grad()
+                if (batch_idx + 1) % info_dict["accum_grad"] == 0:
+                    skip_accumulation_window = False
+                batch_idx += 1
+                continue
+
             # Disable gradient synchronizations across DDP processes.
             if info_dict['train_engine'] == 'torch_ddp' and (batch_idx + 1) % info_dict["accum_grad"] != 0:
                 context = model.no_sync
@@ -104,7 +123,7 @@ class Executor:
                 info_dict['train_batch_idx'] = batch_idx
                 self.cv(
                     model, optimizer, scheduler, cv_data_loader, writer,
-                    info_dict, scaler, on_batch_end=False)
+                    info_dict, scaler, control_group=control_group, on_batch_end=False)
                 model.train()
             batch_idx += 1
         # Longer ranks may still own prefetched batches; release their workers before CV.
@@ -113,7 +132,7 @@ class Executor:
         info_dict['train_batch_idx'] = batch_idx - 1
         self.cv(
             model, optimizer, scheduler, cv_data_loader, writer,
-            info_dict, scaler, on_batch_end=True)
+            info_dict, scaler, control_group=control_group, on_batch_end=True)
 
     def train_one_epoc_gan(self, model, optimizer, scheduler, optimizer_d, scheduler_d, train_data_loader, cv_data_loader,
                            writer, info_dict, scaler, control_group,
@@ -183,7 +202,8 @@ class Executor:
                 self.cv(
                     model, optimizer, scheduler, cv_data_loader, writer,
                     info_dict, scaler, optimizer_d=optimizer_d,
-                    scheduler_d=scheduler_d, on_batch_end=False)
+                    scheduler_d=scheduler_d, control_group=control_group,
+                    on_batch_end=False)
                 model.train()
             batch_idx += 1
         # Longer ranks may still own prefetched batches; release their workers before CV.
@@ -193,11 +213,12 @@ class Executor:
         self.cv(
             model, optimizer, scheduler, cv_data_loader, writer,
             info_dict, scaler, optimizer_d=optimizer_d,
-            scheduler_d=scheduler_d, on_batch_end=True)
+            scheduler_d=scheduler_d, control_group=control_group,
+            on_batch_end=True)
 
     @torch.inference_mode()
     def cv(self, model, optimizer, scheduler, cv_data_loader, writer, info_dict, scaler,
-           optimizer_d=None, scheduler_d=None, on_batch_end=True):
+           optimizer_d=None, scheduler_d=None, control_group=None, on_batch_end=True):
         ''' Cross validation on
         '''
         logging.info('Epoch {} Step {} on_batch_end {} CV rank {}'.format(
@@ -211,6 +232,16 @@ class Executor:
             info_dict["epoch"] = self.epoch
             info_dict["batch_idx"] = batch_idx
 
+            rng_alignment_limit = info_dict.get('rng_alignment_max_speech_feat_numel', 0)
+            if distributed_rng_alignment_limit_exceeded(
+                    batch_dict, rng_alignment_limit, control_group):
+                logging.warning(
+                    'Epoch %s CV batch %s exceeds CUDA/MUSA RNG alignment limit %s; '
+                    'skipping on rank %s (local speech_feat.numel=%s)',
+                    self.epoch, batch_idx, rng_alignment_limit, self.rank,
+                    batch_dict['speech_feat'].numel())
+                continue
+
             num_utts = len(batch_dict["utts"])
             total_num_utts += num_utts
 
@@ -223,6 +254,10 @@ class Executor:
                     total_loss_dict[k] = []
                 total_loss_dict[k].append(v.mean().item() * num_utts)
             log_per_step(None, info_dict)
+        if total_num_utts == 0:
+            raise RuntimeError(
+                'All CV batches were skipped by rng_alignment_max_speech_feat_numel={}.'
+                .format(info_dict.get('rng_alignment_max_speech_feat_numel', 0)))
         for k, v in total_loss_dict.items():
             total_loss_dict[k] = sum(v) / total_num_utts
         info_dict['loss_dict'] = total_loss_dict

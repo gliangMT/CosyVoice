@@ -4,7 +4,7 @@
 # Engineering from-scratch training:
 # - Randomly initialize the selected CosyVoice module (llm/flow/hifigan).
 # - Keep the pretrained Qwen backbone/tokenizer, speech tokenizer, and CAM++.
-# - Never warm-start from pretrained llm.pt, flow.pt, or hift.pt.
+# - Optionally warm-start both CUDA and MUSA from shared_init_checkpoint.
 # - --resume may restore a checkpoint produced by this scratch experiment.
 
 set -euo pipefail
@@ -37,15 +37,6 @@ if [ "$(wc -w <<< "${MODELS}")" -ne 1 ]; then
   echo "Select exactly one model per scratch run: MODELS=llm or MODELS=flow." >&2
   exit 2
 fi
-
-for arg in "$@"; do
-  case "${arg}" in
-    --checkpoint|--checkpoint=*)
-      echo "This scratch script does not accept --checkpoint." >&2
-      exit 2
-      ;;
-  esac
-done
 
 if [ "${stage}" -le -1 ] && [ "${stop_stage}" -ge -1 ]; then
   echo "Data Download"
@@ -120,6 +111,8 @@ prefetch="${prefetch:-100}"
 train_engine="${train_engine:-torch_ddp}"
 resume_mode="${resume_mode:-cross_platform}"
 rdzv_endpoint="${rdzv_endpoint:-localhost:1234}"
+llm_alignment_fp32="${llm_alignment_fp32:-1}"
+shared_init_checkpoint="${shared_init_checkpoint:-}"
 
 if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
   echo "Engineering scratch training: ${MODELS}"
@@ -142,7 +135,30 @@ if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
     log_file="${LOG_DIR}/${model}_${TIMESTAMP}.log"
     mkdir -p "${model_dir}" "${tensorboard_dir}"
 
-    echo "Starting randomly initialized ${model}; log: ${log_file}"
+    rng_alignment_args=()
+    if [ "${model}" = "flow" ]; then
+      rng_alignment_args=(
+        --rng_alignment_max_speech_feat_numel
+        "${rng_alignment_max_speech_feat_numel:-184320}"
+      )
+    fi
+
+    precision_args=(--use_amp)
+    if [ "${model}" = "llm" ] && [ "${llm_alignment_fp32}" = "1" ]; then
+      precision_args=()
+    fi
+
+    checkpoint_args=(--resume auto --resume_mode "${resume_mode}")
+    if [ -n "${shared_init_checkpoint}" ]; then
+      if [ ! -f "${shared_init_checkpoint}" ]; then
+        echo "shared_init_checkpoint does not exist: ${shared_init_checkpoint}" >&2
+        exit 2
+      fi
+      checkpoint_args=(--checkpoint "${shared_init_checkpoint}")
+    fi
+
+    echo "Starting ${model} training; log: ${log_file}"
+    echo "LLM FP32 alignment mode: ${llm_alignment_fp32}; shared init: ${shared_init_checkpoint:-none}"
     torchrun \
       --nnodes=1 \
       --nproc_per_node="${num_gpus}" \
@@ -163,12 +179,12 @@ if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
       --num_workers "${num_workers}" \
       --prefetch "${prefetch}" \
       --pin_memory \
-      --use_amp \
+      "${precision_args[@]}" \
       --deepspeed_config ./conf/ds_stage2.json \
-      --resume auto \
-      --resume_mode "${resume_mode}" \
+      "${checkpoint_args[@]}" \
       --save_per_step 16000 \
       --deepspeed.save_states model+optimizer \
+      "${rng_alignment_args[@]}" \
       "$@" 2>&1 | tee "${log_file}"
   done
 fi

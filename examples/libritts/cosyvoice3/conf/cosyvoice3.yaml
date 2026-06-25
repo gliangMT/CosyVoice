@@ -28,8 +28,13 @@ llm: !new:cosyvoice.llm.llm.CosyVoice3LM
     length_normalized_loss: True
     lsm_weight: 0
     mix_ratio: [5, 15]
+    # Make input construction independent of Python RNG consumption order.
+    bistream_mode: deterministic
+    bistream_seed: !ref <seed>
     llm: !new:cosyvoice.llm.llm.Qwen2Encoder
         pretrain_path: !ref <qwen_pretrain_path>
+        # Establish the cross-platform FP32 baseline with the same unfused path.
+        attn_implementation: eager
     sampling: !name:cosyvoice.utils.common.ras_sampling
         top_p: 0.8
         top_k: 25
@@ -67,6 +72,9 @@ flow: !new:cosyvoice.flow.flow.CausalMaskedDiffWithDiT
             depth: 22
             heads: 16
             dim_head: 64
+            # CUDA and MUSA use different RNG launch grids for large dropout masks.
+            # Keep DiT dropout disabled when comparing cross-platform loss curves.
+            dropout: 0.0
             ff_mult: 2
             mel_dim: 80
             mu_dim: 80

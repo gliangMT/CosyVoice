@@ -74,7 +74,8 @@ from cosyvoice.utils.train_utils import (
     init_distributed,
     init_dataset_and_dataloader,
     init_optimizer_and_scheduler,
-    init_summarywriter, load_training_state, resolve_ddp_resume_checkpoint,
+    init_summarywriter, load_cross_platform_training_state, load_training_state,
+    resolve_ddp_resume_checkpoint,
     save_model, set_global_random_seed, set_scheduler_step,
     wrap_cuda_model, check_modify_and_save_config)
 
@@ -97,6 +98,10 @@ def get_args():
                         nargs='?',
                         const='auto',
                         help='resume full training state from PATH; auto uses latest or starts fresh if none exists')
+    parser.add_argument('--resume_mode',
+                        default='exact',
+                        choices=['exact', 'cross_platform', 'weights_only'],
+                        help='exact restores all state; cross_platform migrates portable state; weights_only resets training state')
     parser.add_argument('--model_dir', required=True, help='save model dir')
     parser.add_argument('--tensorboard_dir',
                         default='tensorboard',
@@ -247,15 +252,43 @@ def main():
     info_dict = deepcopy(configs['train_conf'])
     resume_state, resume_rng_state = {}, None
     if resume_checkpoint is not None:
-        resume_state, resume_rng_state = load_training_state(
-            resume_checkpoint, optimizer, scheduler, info_dict,
-            optimizer_d=optimizer_d, scheduler_d=scheduler_d, scaler=scaler)
-        start_step = resume_state.get('step', start_step)
-        start_epoch = resume_state.get('epoch', start_epoch)
-        if not resume_state:
-            set_scheduler_step(scheduler, start_step)
-            if scheduler_d is not None:
-                set_scheduler_step(scheduler_d, start_step)
+        if args.resume_mode in ('cross_platform', 'weights_only'):
+            if not os.path.basename(resume_checkpoint).endswith('_whole.pt'):
+                raise RuntimeError(
+                    'Cross-platform resume requires an epoch_*_whole.pt checkpoint.')
+            if args.resume_mode == 'cross_platform':
+                resume_state, resume_rng_state = load_cross_platform_training_state(
+                    resume_checkpoint, optimizer, scheduler, info_dict,
+                    optimizer_d=optimizer_d, scheduler_d=scheduler_d, scaler=scaler)
+                start_step = resume_state.get('step', start_step)
+                start_epoch = resume_state.get('epoch', start_epoch)
+                if not resume_state:
+                    set_scheduler_step(scheduler, start_step)
+                    if scheduler_d is not None:
+                        set_scheduler_step(scheduler_d, start_step)
+                resume_state['epoch_complete'] = True
+            else:
+                resume_state = {
+                    'epoch': start_epoch,
+                    'step': start_step,
+                    'epoch_complete': True,
+                }
+                set_scheduler_step(scheduler, start_step)
+                if scheduler_d is not None:
+                    set_scheduler_step(scheduler_d, start_step)
+                logging.warning(
+                    'Weights-only resume from %s: optimizer, AMP scaler, and RNG state are reset.',
+                    resume_checkpoint)
+        else:
+            resume_state, resume_rng_state = load_training_state(
+                resume_checkpoint, optimizer, scheduler, info_dict,
+                optimizer_d=optimizer_d, scheduler_d=scheduler_d, scaler=scaler)
+            start_step = resume_state.get('step', start_step)
+            start_epoch = resume_state.get('epoch', start_epoch)
+            if not resume_state:
+                set_scheduler_step(scheduler, start_step)
+                if scheduler_d is not None:
+                    set_scheduler_step(scheduler_d, start_step)
     elif args.resume is not None:
         if args.resume == 'auto':
             load_dir, tag = args.model_dir, None
@@ -322,9 +355,13 @@ def main():
             'Legacy intra-epoch checkpoint {} has no .train.pt state and cannot be resumed safely. '
             'Use an epoch_*_whole.pt checkpoint instead.'.format(resume_checkpoint))
     if resume_state and resume_state.get('world_size', dist.get_world_size()) != dist.get_world_size():
-        raise RuntimeError(
-            'Exact resume requires world size {}, but the current world size is {}.'
-            .format(resume_state['world_size'], dist.get_world_size()))
+        if args.resume_mode == 'exact':
+            raise RuntimeError(
+                'Exact resume requires world size {}, but the current world size is {}.'
+                .format(resume_state['world_size'], dist.get_world_size()))
+        logging.warning(
+            'Cross-platform resume changes world size from %s to %s.',
+            resume_state['world_size'], dist.get_world_size())
     first_epoch = start_epoch + 1 if epoch_complete else start_epoch
     resume_batch_idx = 0 if epoch_complete else resume_state.get('train_batch_idx', -1) + 1
     try:

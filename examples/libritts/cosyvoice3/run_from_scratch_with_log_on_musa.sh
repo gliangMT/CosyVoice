@@ -30,8 +30,8 @@ data_dir="${data_dir:-/home/cosyvoice-test/data/libritts}"
 pretrained_model_dir="${pretrained_model_dir:-/home/cosyvoice-test/pretrained_models/Fun-CosyVoice3-0.5B}"
 
 # Train one module per launch because LLM and Flow use different train_conf.
-# MODELS="${MODELS:-llm}"
-MODELS="${MODELS:-flow}"
+MODELS="${MODELS:-llm}"
+# MODELS="${MODELS:-flow}"
 
 if [ "$(wc -w <<< "${MODELS}")" -ne 1 ]; then
   echo "Select exactly one model per scratch run: MODELS=llm or MODELS=flow." >&2
@@ -118,11 +118,12 @@ dist_backend="${dist_backend:-nccl}"
 num_workers="${num_workers:-2}"
 prefetch="${prefetch:-100}"
 train_engine="${train_engine:-torch_ddp}"
+resume_mode="${resume_mode:-cross_platform}"
 rdzv_endpoint="${rdzv_endpoint:-localhost:1234}"
 
 if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
   echo "Engineering scratch training: ${MODELS}"
-  echo "No pretrained CosyVoice module checkpoint will be loaded."
+  echo "Resume mode: ${resume_mode}"
 
   cat data/{train-clean-100,train-clean-360,train-other-500}/parquet/data.list > data/train.data.list
   cat data/{dev-clean,dev-other}/parquet/data.list > data/dev.data.list
@@ -165,6 +166,7 @@ if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
       --use_amp \
       --deepspeed_config ./conf/ds_stage2.json \
       --resume auto \
+      --resume_mode "${resume_mode}" \
       --save_per_step 16000 \
       --deepspeed.save_states model+optimizer \
       "$@" 2>&1 | tee "${log_file}"

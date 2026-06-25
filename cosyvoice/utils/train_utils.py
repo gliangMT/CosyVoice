@@ -18,6 +18,10 @@ import logging
 import os
 import glob
 import hashlib
+from copy import deepcopy
+from importlib import import_module
+from importlib.metadata import PackageNotFoundError, version
+import platform
 import random
 import torch
 import json
@@ -318,22 +322,94 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
+def _package_version(package):
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return None
+
+
+def _onnxruntime_version():
+    for package in ['onnxruntime', 'onnxruntime-gpu', 'onnxruntime-musa']:
+        package_version = _package_version(package)
+        if package_version is not None:
+            return package_version
+    return None
+
+
+def _onnxruntime_providers():
+    try:
+        return import_module('onnxruntime').get_available_providers()
+    except Exception as ex:
+        logging.debug('Failed to query ONNX Runtime providers: %s', ex)
+        return None
+
+
+def _device_name(device_type):
+    try:
+        if device_type == 'musa':
+            return torch.musa.get_device_name(int(os.environ.get('LOCAL_RANK', 0)))
+        if device_type == 'cuda':
+            return torch.cuda.get_device_name(int(os.environ.get('LOCAL_RANK', 0)))
+    except Exception as ex:
+        logging.debug('Failed to query %s device name: %s', device_type, ex)
+    return None
+
+
 def _accelerator_signature():
-    if hasattr(torch, 'musa') and torch.musa.is_available():
+    requested_accelerator = os.environ.get('ACCELERATOR_BACKEND', '').lower()
+    musa_active = requested_accelerator == 'musa'
+    cuda_active = requested_accelerator == 'cuda'
+    if not musa_active and not cuda_active:
+        musa_active = hasattr(torch, 'musa') and torch.musa.is_available()
+        cuda_active = not musa_active and torch.cuda.is_available()
+
+    if musa_active:
+        try:
+            mccl_version = torch.musa.mccl.version()
+        except Exception:
+            mccl_version = None
         return {
             'accelerator': 'musa',
-            'torch_musa_version': getattr(torch.version, 'musa', None),
+            'accelerator_runtime_version': getattr(torch.version, 'musa', None),
+            'accelerator_device_name': _device_name('musa'),
+            'musa_version': getattr(torch.version, 'musa', None),
+            'torch_musa_version': _package_version('torch_musa'),
+            'torchada_version': _package_version('torchada'),
+            'mccl_version': mccl_version,
+            'cuda_version': None,
+            'cudnn_version': None,
+            'nccl_version': None,
+        }
+    if cuda_active:
+        try:
+            nccl_version = torch.cuda.nccl.version()
+        except Exception:
+            nccl_version = None
+        return {
+            'accelerator': 'cuda',
+            'accelerator_runtime_version': torch.version.cuda,
+            'accelerator_device_name': _device_name('cuda'),
+            'musa_version': None,
+            'torch_musa_version': None,
+            'torchada_version': _package_version('torchada'),
+            'mccl_version': None,
+            'cuda_version': torch.version.cuda,
+            'cudnn_version': torch.backends.cudnn.version(),
+            'nccl_version': nccl_version,
         }
     signature = {
-        'accelerator': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'cuda_version': torch.version.cuda,
+        'accelerator': 'cpu',
+        'accelerator_runtime_version': None,
+        'accelerator_device_name': platform.processor() or None,
+        'musa_version': None,
+        'torch_musa_version': _package_version('torch_musa'),
+        'torchada_version': _package_version('torchada'),
+        'mccl_version': None,
+        'cuda_version': None,
+        'cudnn_version': None,
+        'nccl_version': None,
     }
-    if hasattr(torch.backends, 'cudnn'):
-        signature['cudnn_version'] = torch.backends.cudnn.version()
-    try:
-        signature['nccl_version'] = torch.cuda.nccl.version() if torch.cuda.is_available() else None
-    except Exception:
-        signature['nccl_version'] = None
     return signature
 
 
@@ -345,10 +421,24 @@ def resume_signature(info_dict):
             'num_workers', 'prefetch', 'accum_grad', 'use_amp', 'dtype',
             'save_per_step', 'grad_clip', 'optim', 'optim_conf',
             'scheduler', 'scheduler_conf', 'qwen_pretrain_path', 'onnx_path',
+            'dist_backend',
         ]
     }
+    signature['signature_version'] = 2
+    signature['python_version'] = platform.python_version()
+    signature['platform'] = platform.platform()
     signature['torch_version'] = str(torch.__version__)
-    signature.update(_accelerator_signature())
+    signature['onnxruntime_version'] = _onnxruntime_version()
+    signature['onnxruntime_providers'] = _onnxruntime_providers()
+    signature['onnx_provider_request'] = os.environ.get('COSYVOICE_ONNX_PROVIDER', 'auto')
+    signature['world_size'] = int(os.environ.get('WORLD_SIZE', 1))
+    accelerator_signature = _accelerator_signature()
+    signature['visible_devices'] = (
+        os.environ.get('MUSA_VISIBLE_DEVICES')
+        if accelerator_signature['accelerator'] == 'musa'
+        else os.environ.get('CUDA_VISIBLE_DEVICES')
+    )
+    signature.update(accelerator_signature)
     for key in ['config', 'train_data', 'cv_data']:
         path = info_dict.get(key)
         if path:
@@ -375,7 +465,7 @@ def find_latest_ddp_checkpoint(model_dir):
 
     candidates = [
         path for path in glob.glob(os.path.join(model_dir, 'epoch_*.pt'))
-        if not path.endswith('.train.pt')
+        if re.search(r'epoch_\d+_(?:whole|step_\d+)\.pt$', os.path.basename(path))
     ]
     if not candidates:
         raise FileNotFoundError('No resumable DDP checkpoint found in {}'.format(model_dir))
@@ -400,6 +490,7 @@ def _validate_resume_signature(saved_signature, current_info):
         logging.warning('Checkpoint has no resume signature; exact data/config alignment cannot be verified.')
         return
     current_signature = resume_signature(current_info)
+    _log_resume_signatures(saved_signature, current_signature)
     mismatches = []
     for key, saved_value in saved_signature.items():
         current_value = current_signature.get(key)
@@ -409,6 +500,130 @@ def _validate_resume_signature(saved_signature, current_info):
         raise RuntimeError(
             'Resume configuration does not match the checkpoint:\n  {}'
             .format('\n  '.join(mismatches)))
+
+
+def _log_resume_signatures(saved_signature, current_signature):
+    if int(os.environ.get('RANK', 0)) != 0:
+        return
+    logging.info(
+        'Checkpoint resume signature:\n%s',
+        yaml.safe_dump(saved_signature, sort_keys=True).rstrip())
+    logging.info(
+        'Current resume signature:\n%s',
+        yaml.safe_dump(current_signature, sort_keys=True).rstrip())
+
+
+def _validate_cross_platform_signature(saved_signature, current_info):
+    if not saved_signature:
+        logging.warning('Checkpoint has no resume signature; cross-platform compatibility cannot be verified.')
+        return
+    current_signature = resume_signature(current_info)
+    _log_resume_signatures(saved_signature, current_signature)
+    required_keys = {
+        'model', 'train_engine', 'accum_grad', 'dtype', 'optim', 'optim_conf',
+        'scheduler', 'scheduler_conf', 'train_data_sha256', 'cv_data_sha256',
+    }
+    incompatible = []
+    ignored = []
+    missing = '<missing>'
+    for key in sorted(set(saved_signature) | set(current_signature)):
+        saved_value = saved_signature.get(key, missing)
+        current_value = current_signature.get(key, missing)
+        if current_value == saved_value:
+            continue
+        mismatch = '{}: saved={!r}, current={!r}'.format(key, saved_value, current_value)
+        if key in required_keys:
+            incompatible.append(mismatch)
+        else:
+            ignored.append(mismatch)
+    if incompatible:
+        raise RuntimeError(
+            'Cross-platform resume has incompatible training state:\n  {}'
+            .format('\n  '.join(incompatible)))
+    if ignored and int(os.environ.get('RANK', 0)) == 0:
+        logging.warning(
+            'Cross-platform resume ignores platform/path differences:\n  %s',
+            '\n  '.join(ignored))
+
+
+def _move_state_to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device=device)
+    if isinstance(value, dict):
+        return {key: _move_state_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_state_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_state_to_device(item, device) for item in value)
+    return value
+
+
+def _load_optimizer_state_cross_platform(optimizer, state_dict, name):
+    if optimizer is None or state_dict is None:
+        return False
+    initial_state = deepcopy(optimizer.state_dict())
+    try:
+        optimizer.load_state_dict(state_dict)
+        for parameter, state in list(optimizer.state.items()):
+            optimizer.state[parameter] = _move_state_to_device(state, parameter.device)
+        logging.info('Restored %s state on the current accelerator', name)
+        return True
+    except Exception as ex:
+        optimizer.load_state_dict(initial_state)
+        logging.warning('Failed to restore %s state; using a fresh %s: %s', name, name, ex)
+        return False
+
+
+def load_cross_platform_training_state(checkpoint_path, optimizer, scheduler, current_info,
+                                       optimizer_d=None, scheduler_d=None, scaler=None):
+    state_path = training_state_path(checkpoint_path)
+    if not os.path.isfile(state_path):
+        logging.warning(
+            'Training state %s is missing; only model weights, epoch, and step will be restored.',
+            state_path)
+        return {}, None
+
+    state = torch.load(state_path, map_location='cpu', weights_only=False)
+    _validate_cross_platform_signature(state.get('resume_signature'), current_info)
+    _load_optimizer_state_cross_platform(optimizer, state.get('optimizer'), 'optimizer')
+    _load_optimizer_state_cross_platform(optimizer_d, state.get('optimizer_d'), 'discriminator optimizer')
+
+    try:
+        scheduler.load_state_dict(state['scheduler'])
+        logging.info('Restored scheduler state')
+    except Exception as ex:
+        set_scheduler_step(scheduler, state.get('step', 0))
+        logging.warning('Failed to restore scheduler state; restored step only: %s', ex)
+    if scheduler_d is not None and state.get('scheduler_d') is not None:
+        try:
+            scheduler_d.load_state_dict(state['scheduler_d'])
+            logging.info('Restored discriminator scheduler state')
+        except Exception as ex:
+            set_scheduler_step(scheduler_d, state.get('step', 0))
+            logging.warning('Failed to restore discriminator scheduler state; restored step only: %s', ex)
+    if scaler is not None and state.get('scaler') is not None:
+        try:
+            scaler.load_state_dict(state['scaler'])
+            logging.info('Restored AMP GradScaler state')
+        except Exception as ex:
+            logging.warning('Failed to restore AMP GradScaler state; using a fresh scaler: %s', ex)
+
+    rank = int(os.environ.get('RANK', 0))
+    rng_path = re.sub(r'\.pt$', '.rank{}.rng.pt'.format(rank), checkpoint_path)
+    rng_state = None
+    if os.path.isfile(rng_path):
+        saved_rng = torch.load(rng_path, map_location='cpu', weights_only=False)
+        rng_state = {
+            key: saved_rng[key]
+            for key in ['python', 'numpy', 'torch']
+            if key in saved_rng
+        }
+        logging.warning(
+            'Restored portable RNG state from %s; accelerator RNG is reset for the current platform.',
+            rng_path)
+    else:
+        logging.warning('RNG state %s is missing; all RNG streams use their new-run state.', rng_path)
+    return state, rng_state
 
 
 def load_training_state(checkpoint_path, optimizer, scheduler, current_info,

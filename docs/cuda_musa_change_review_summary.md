@@ -1,10 +1,10 @@
 # CUDA/MUSA 精度对齐与评测链路改动 Review 说明
 
-本文用于代码 review 和会议交流，目标是把当前工作区中围绕 CosyVoice3、MUSA 适配、CUDA/MUSA from-scratch 对齐、Seed-TTS-Eval 自动评测所做的改动讲清楚。
+本文用于代码review, 主要围绕`CosyVoice`的MUSA适配、CUDA/MUSA from-scratch 对齐、`Seed-TTS-Eval`评测脚本所做的改动讲清楚。
 
 ## 0. 基线与范围说明
 
-本次总结涉及两个独立 git 仓库，基线分别如下。
+本次总结涉及两个独立 git 仓库，基线分别如下:
 
 CosyVoice 主仓：
 

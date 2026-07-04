@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import os
 import time
 
@@ -45,6 +45,8 @@ class Executor:
         self.epoch = 0
         self.rank = int(os.environ.get('RANK', 0))
         self.device = torch.device('cuda:{}'.format(self.rank))
+        self.profile_seen_steps = 0
+        self.profiled_train_steps = 0
 
     def train_one_epoc(self, model, optimizer, scheduler, train_data_loader, cv_data_loader, writer, info_dict, scaler,
                        control_group, ref_model=None, resume_batch_idx=0, resume_rng_state=None):
@@ -108,11 +110,14 @@ class Executor:
             else:
                 context = nullcontext
 
-            with context():
-                info_dict = batch_forward(model, batch_dict, scaler, info_dict, ref_model=self.ref_model, dpo_loss=self.dpo_loss)
-                info_dict = batch_backward(model, scaler, info_dict)
+            with self._maybe_profile_train_step(info_dict) as prof:
+                with context():
+                    info_dict = batch_forward(model, batch_dict, scaler, info_dict,
+                                              ref_model=self.ref_model, dpo_loss=self.dpo_loss)
+                    info_dict = batch_backward(model, scaler, info_dict)
 
-            info_dict = update_parameter_and_lr(model, optimizer, scheduler, scaler, info_dict)
+                info_dict = update_parameter_and_lr(model, optimizer, scheduler, scaler, info_dict)
+            self._log_train_step_profile(prof, info_dict)
             log_per_step(writer, info_dict)
             if (batch_idx + 1) % info_dict["accum_grad"] == 0:
                 self.step += 1
@@ -178,19 +183,21 @@ class Executor:
             else:
                 context = nullcontext
 
-            with context():
-                batch_dict['turn'] = 'discriminator'
-                info_dict = batch_forward(model, batch_dict, scaler, info_dict)
-                info_dict = batch_backward(model, scaler, info_dict)
-            info_dict = update_parameter_and_lr(model, optimizer_d, scheduler_d, scaler, info_dict)
-            optimizer.zero_grad()
-            log_per_step(writer, info_dict)
-            with context():
-                batch_dict['turn'] = 'generator'
-                info_dict = batch_forward(model, batch_dict, scaler, info_dict)
-                info_dict = batch_backward(model, scaler, info_dict)
-            info_dict = update_parameter_and_lr(model, optimizer, scheduler, scaler, info_dict)
-            optimizer_d.zero_grad()
+            with self._maybe_profile_train_step(info_dict) as prof:
+                with context():
+                    batch_dict['turn'] = 'discriminator'
+                    info_dict = batch_forward(model, batch_dict, scaler, info_dict)
+                    info_dict = batch_backward(model, scaler, info_dict)
+                info_dict = update_parameter_and_lr(model, optimizer_d, scheduler_d, scaler, info_dict)
+                optimizer.zero_grad()
+                log_per_step(writer, info_dict)
+                with context():
+                    batch_dict['turn'] = 'generator'
+                    info_dict = batch_forward(model, batch_dict, scaler, info_dict)
+                    info_dict = batch_backward(model, scaler, info_dict)
+                info_dict = update_parameter_and_lr(model, optimizer, scheduler, scaler, info_dict)
+                optimizer_d.zero_grad()
+            self._log_train_step_profile(prof, info_dict)
             log_per_step(writer, info_dict)
             if (batch_idx + 1) % info_dict["accum_grad"] == 0:
                 self.step += 1
@@ -299,3 +306,130 @@ class Executor:
                     'Resume skip progress %s/%s batches, elapsed %.1fs, ETA %.1fs',
                     completed, resume_batch_idx, elapsed, remaining)
         return resume_batch_idx
+
+    @contextmanager
+    def _maybe_profile_train_step(self, info_dict):
+        if not info_dict.get('profile_train', False):
+            yield None
+            return
+        active_steps = info_dict.get('profile_train_steps', 3)
+        warmup_steps = info_dict.get('profile_warmup_steps', 3)
+        profile_rank = info_dict.get('profile_rank', 0)
+        if active_steps <= 0:
+            yield None
+            return
+        if profile_rank >= 0 and self.rank != profile_rank:
+            yield None
+            return
+        if self.profiled_train_steps >= active_steps:
+            yield None
+            return
+        if self.profile_seen_steps < warmup_steps:
+            logging.info(
+                'Train step profiler warmup rank=%s epoch=%s batch=%s step=%s warmup=%s/%s',
+                self.rank, info_dict.get('epoch'), info_dict.get('batch_idx'), info_dict.get('step'),
+                self.profile_seen_steps + 1, warmup_steps)
+            try:
+                yield None
+            finally:
+                self.profile_seen_steps += 1
+            return
+
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        accelerator_activity = self._profiler_accelerator_activity()
+        if accelerator_activity is not None:
+            activities.append(accelerator_activity)
+
+        logging.info(
+            'Starting train step profiler rank=%s epoch=%s batch=%s step=%s active=%s/%s',
+            self.rank, info_dict.get('epoch'), info_dict.get('batch_idx'), info_dict.get('step'),
+            self.profiled_train_steps + 1, active_steps)
+        with torch.profiler.profile(
+                activities=activities,
+                record_shapes=True,
+                profile_memory=False,
+                with_stack=info_dict.get('profile_with_stack', True)) as prof:
+            yield prof
+        self.profile_seen_steps += 1
+        self.profiled_train_steps += 1
+
+    @staticmethod
+    def _profiler_accelerator_activity():
+        if hasattr(torch, 'musa') and torch.musa.is_available():
+            musa_activity = getattr(torch.profiler.ProfilerActivity, 'MUSA', None)
+            if musa_activity is not None:
+                return musa_activity
+        if torch.cuda.is_available():
+            return getattr(torch.profiler.ProfilerActivity, 'CUDA')
+        return None
+
+    def _log_train_step_profile(self, prof, info_dict):
+        if prof is None:
+            return
+        events = prof.key_averages()
+        attention_events = [
+            event for event in events
+            if self._is_attention_profiler_event(event.key)
+        ]
+        if not attention_events:
+            logging.warning(
+                'Train step profiler rank=%s epoch=%s batch=%s step=%s found no attention-related ops',
+                self.rank, info_dict.get('epoch'), info_dict.get('batch_idx'), info_dict.get('step'))
+        else:
+            logging.info(
+                'Train step profiler rank=%s epoch=%s batch=%s step=%s found %s attention-related ops',
+                self.rank, info_dict.get('epoch'), info_dict.get('batch_idx'), info_dict.get('step'),
+                len(attention_events))
+            attention_events = sorted(
+                attention_events,
+                key=lambda event: self._event_device_time_total(event) + getattr(event, 'cpu_time_total', 0.0),
+                reverse=True)
+            for event in attention_events:
+                logging.info(
+                    'Train step profiler attention op key=%s calls=%s cpu_total_ms=%.3f device_total_ms=%.3f',
+                    event.key,
+                    getattr(event, 'count', 0),
+                    getattr(event, 'cpu_time_total', 0.0) / 1000.0,
+                    self._event_device_time_total(event) / 1000.0)
+
+        sort_by = self._profiler_sort_key(events)
+        try:
+            logging.info('Train step profiler top ops:\n%s', events.table(sort_by=sort_by, row_limit=20))
+        except Exception as ex:
+            logging.warning('Failed to render train step profiler table: %s', ex)
+
+        profile_dir = info_dict.get('profile_dir')
+        if profile_dir:
+            os.makedirs(profile_dir, exist_ok=True)
+            trace_path = os.path.join(
+                profile_dir,
+                'train_step_rank{}_epoch{}_batch{}_step{}.json'.format(
+                    self.rank, info_dict.get('epoch'), info_dict.get('batch_idx'), info_dict.get('step')))
+            prof.export_chrome_trace(trace_path)
+            logging.info('Train step profiler trace saved to %s', trace_path)
+
+    @staticmethod
+    def _is_attention_profiler_event(key):
+        key = key.lower()
+        return any(token in key for token in (
+            'scaled_dot_product',
+            'sdpa',
+            'flash',
+        ))
+
+    @staticmethod
+    def _event_device_time_total(event):
+        return getattr(
+            event,
+            'musa_time_total',
+            getattr(event, 'cuda_time_total', getattr(event, 'device_time_total', 0.0)))
+
+    @classmethod
+    def _profiler_sort_key(cls, events):
+        if any(getattr(event, 'musa_time_total', 0.0) > 0 for event in events):
+            return 'musa_time_total'
+        if any(getattr(event, 'cuda_time_total', 0.0) > 0 for event in events):
+            return 'cuda_time_total'
+        if any(getattr(event, 'device_time_total', 0.0) > 0 for event in events):
+            return 'device_time_total'
+        return 'cpu_time_total'

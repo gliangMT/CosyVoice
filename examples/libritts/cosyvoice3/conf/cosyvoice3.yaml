@@ -29,12 +29,12 @@ llm: !new:cosyvoice.llm.llm.CosyVoice3LM
     lsm_weight: 0
     mix_ratio: [5, 15]
     # Make input construction independent of Python RNG consumption order.
-    bistream_mode: deterministic
+    bistream_mode: random # deterministic ， random
     bistream_seed: !ref <seed>
     llm: !new:cosyvoice.llm.llm.Qwen2Encoder
         pretrain_path: !ref <qwen_pretrain_path>
-        # Establish the cross-platform FP32 baseline with the same unfused path.
-        attn_implementation: eager
+        # Use Transformers SDPA while train.py can force PyTorch SDPA to math.
+        attn_implementation: sdpa # eager, sdpa
     sampling: !name:cosyvoice.utils.common.ras_sampling
         top_p: 0.8
         top_k: 25

@@ -111,7 +111,13 @@ prefetch="${prefetch:-100}"
 train_engine="${train_engine:-torch_ddp}"
 resume_mode="${resume_mode:-cross_platform}"
 rdzv_endpoint="${rdzv_endpoint:-localhost:1234}"
-llm_alignment_fp32="${llm_alignment_fp32:-1}"
+llm_alignment_fp32="${llm_alignment_fp32:-0}"
+sdpa_backend="${sdpa_backend:-math}"
+profile_train="${profile_train:-0}"
+profile_train_steps="${profile_train_steps:-3}"
+profile_warmup_steps="${profile_warmup_steps:-3}"
+profile_rank="${profile_rank:--1}"
+profile_dir="${profile_dir:-}"
 shared_init_checkpoint="${shared_init_checkpoint:-}"
 
 if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
@@ -143,10 +149,28 @@ if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
       )
     fi
 
-    precision_args=(--use_amp)
-    if [ "${model}" = "llm" ] && [ "${llm_alignment_fp32}" = "1" ]; then
-      precision_args=()
+    sdpa_args=()
+    if [ "${sdpa_backend}" != "auto" ]; then
+      sdpa_args=(--sdpa_backend "${sdpa_backend}")
     fi
+
+    profile_args=()
+    if [ "${profile_train}" = "1" ]; then
+      profile_args=(
+        --profile_train
+        --profile_train_steps "${profile_train_steps}"
+        --profile_warmup_steps "${profile_warmup_steps}"
+        --profile_rank "${profile_rank}"
+      )
+      if [ -n "${profile_dir}" ]; then
+        profile_args+=(--profile_dir "${profile_dir}")
+      fi
+    fi
+
+    precision_args=(--use_amp)
+    #if [ "${model}" = "llm" ] && [ "${llm_alignment_fp32}" = "1" ]; then
+    #  precision_args=()
+    #fi
 
     checkpoint_args=(--resume auto --resume_mode "${resume_mode}")
     if [ -n "${shared_init_checkpoint}" ]; then
@@ -158,7 +182,7 @@ if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
     fi
 
     echo "Starting ${model} training; log: ${log_file}"
-    echo "LLM FP32 alignment mode: ${llm_alignment_fp32}; shared init: ${shared_init_checkpoint:-none}"
+    echo "LLM FP32 alignment mode: ${llm_alignment_fp32}; SDPA backend: ${sdpa_backend}; train step profiling: ${profile_train}; warmup: ${profile_warmup_steps}; active: ${profile_train_steps}; shared init: ${shared_init_checkpoint:-none}"
     torchrun \
       --nnodes=1 \
       --nproc_per_node="${num_gpus}" \
@@ -180,6 +204,8 @@ if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
       --prefetch "${prefetch}" \
       --pin_memory \
       "${precision_args[@]}" \
+      "${sdpa_args[@]}" \
+      "${profile_args[@]}" \
       --deepspeed_config ./conf/ds_stage2.json \
       "${checkpoint_args[@]}" \
       --save_per_step 16000 \

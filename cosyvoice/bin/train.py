@@ -45,6 +45,36 @@ def is_musa_environment():
     return musa_visible_devices not in (None, '', '-1')
 
 
+def configure_sdpa_backend(sdpa_backend):
+    if sdpa_backend == 'auto':
+        return
+    if not hasattr(torch.backends, 'cuda'):
+        raise RuntimeError('--sdpa_backend requires torch.backends.cuda support')
+
+    backend_flags = {
+        'math': {
+            'enable_math_sdp': True,
+            'enable_flash_sdp': False,
+        },
+        'flash': {
+            'enable_math_sdp': False,
+            'enable_flash_sdp': True,
+        },
+    }[sdpa_backend]
+    for setter_name, enabled in backend_flags.items():
+        setter = getattr(torch.backends.cuda, setter_name, None)
+        if setter is not None:
+            setter(enabled)
+    def sdp_enabled(getter_name):
+        getter = getattr(torch.backends.cuda, getter_name, None)
+        return getter() if getter is not None else 'n/a'
+    logging.info('Using SDPA %s backend', sdpa_backend)
+    logging.info(
+        'SDPA flags: math=%s flash=%s',
+        sdp_enabled('math_sdp_enabled'),
+        sdp_enabled('flash_sdp_enabled'))
+
+
 try:
     import torchada  # noqa: F401 - must patch accelerator APIs before importing torch
 except ImportError as ex:
@@ -131,6 +161,32 @@ def get_args():
                         action=argparse.BooleanOptionalAction,
                         default=True,
                         help='require deterministic PyTorch algorithms')
+    parser.add_argument('--sdpa_backend',
+                        default='auto',
+                        choices=['auto', 'math', 'flash'],
+                        help='select the global PyTorch SDPA kernel backend; auto keeps the PyTorch default')
+    parser.add_argument('--profile_train',
+                        action='store_true',
+                        default=False,
+                        help='enable train step profiling')
+    parser.add_argument('--profile_train_steps',
+                        default=3,
+                        type=int,
+                        help='profile this many train steps after warmup')
+    parser.add_argument('--profile_warmup_steps',
+                        default=3,
+                        type=int,
+                        help='number of train steps to warm up before profiler collection')
+    parser.add_argument('--profile_rank',
+                        default=-1,
+                        type=int,
+                        help='rank to profile; use -1 to profile every rank')
+    parser.add_argument('--profile_dir',
+                        help='optional directory for Chrome trace files from train step profiling')
+    parser.add_argument('--profile_with_stack',
+                        action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='record Python stack traces in train step profiler')
     parser.add_argument('--rng_alignment_max_speech_feat_numel',
                         default=0,
                         type=int,
@@ -177,6 +233,7 @@ def main():
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s',
                         force=True)
+    configure_sdpa_backend(args.sdpa_backend)
     # gan train has some special initialization logic
     gan = True if args.model == 'hifigan' else False
 

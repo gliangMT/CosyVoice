@@ -142,6 +142,9 @@ def get_args():
                         action='store_true',
                         default=False,
                         help='Use automatic mixed precision training')
+    parser.add_argument('--sdpa_backend',
+                        choices=['auto', 'flash', 'math'],
+                        help='SDPA backend for torch scaled_dot_product_attention')
     parser.add_argument('--dpo',
                         action='store_true',
                         default=False,
@@ -187,9 +190,12 @@ def main():
         configs['train_conf'] = configs['train_conf_gan']
     train_args = vars(args).copy()
     save_per_step = train_args.pop('save_per_step')
+    sdpa_backend = train_args.pop('sdpa_backend')
     configs['train_conf'].update(train_args)
     if save_per_step is not None:
         configs['train_conf']['save_per_step'] = save_per_step
+    if sdpa_backend is not None:
+        configs['train_conf']['sdpa_backend'] = sdpa_backend
 
     # Init env for ddp
     init_distributed(args)

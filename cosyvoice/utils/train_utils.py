@@ -18,6 +18,7 @@ import logging
 import os
 import glob
 import hashlib
+from contextlib import nullcontext
 from copy import deepcopy
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
@@ -44,6 +45,47 @@ from deepspeed.runtime.zero.stage_1_and_2 import estimate_zero2_model_states_mem
 from cosyvoice.dataset.dataset import Dataset
 from cosyvoice.utils.device import is_gpu_available
 from cosyvoice.utils.scheduler import WarmupLR, NoamHoldAnnealing, ConstantLR
+
+
+SUPPORTED_SDPA_BACKENDS = ('auto', 'flash', 'math')
+
+
+def normalize_sdpa_backend(sdpa_backend):
+    if sdpa_backend is None:
+        return 'auto'
+    if not isinstance(sdpa_backend, str):
+        raise ValueError('sdpa_backend must be one of {}, got {!r}'.format(
+            SUPPORTED_SDPA_BACKENDS, sdpa_backend))
+    sdpa_backend = sdpa_backend.lower().strip()
+    if sdpa_backend not in SUPPORTED_SDPA_BACKENDS:
+        raise ValueError('unsupported sdpa_backend {!r}; expected one of {}'.format(
+            sdpa_backend, SUPPORTED_SDPA_BACKENDS))
+    return sdpa_backend
+
+
+def sdpa_kernel_context(sdpa_backend):
+    sdpa_backend = normalize_sdpa_backend(sdpa_backend)
+    if sdpa_backend == 'auto':
+        return nullcontext()
+
+    if hasattr(torch.nn, 'attention') and hasattr(torch.nn.attention, 'sdpa_kernel') and \
+       hasattr(torch.nn.attention, 'SDPBackend'):
+        sdp_backend = torch.nn.attention.SDPBackend
+        selected_backend = {
+            'flash': sdp_backend.FLASH_ATTENTION,
+            'math': sdp_backend.MATH,
+        }[sdpa_backend]
+        return torch.nn.attention.sdpa_kernel(selected_backend)
+
+    if hasattr(torch.backends.cuda, 'sdp_kernel'):
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=sdpa_backend == 'flash',
+            enable_math=sdpa_backend == 'math',
+            enable_mem_efficient=False,
+            enable_cudnn=False,
+        )
+
+    raise RuntimeError('This PyTorch build does not support selecting the SDPA backend.')
 
 
 def seed_worker(worker_id):
@@ -124,6 +166,8 @@ def seed_dataloader_for_epoch(data_loader, epoch, data_seed):
 
 
 def check_modify_and_save_config(args, configs):
+    configs['train_conf']['sdpa_backend'] = normalize_sdpa_backend(
+        configs['train_conf'].get('sdpa_backend', 'auto'))
     if args.train_engine == "torch_ddp":
         configs['train_conf']["dtype"] = 'bf16' if args.use_amp is True else 'fp32'
     else:
@@ -419,7 +463,7 @@ def resume_signature(info_dict):
         for key in [
             'model', 'train_engine', 'seed', 'data_seed', 'deterministic',
             'num_workers', 'prefetch', 'accum_grad', 'use_amp', 'dtype',
-            'save_per_step', 'grad_clip', 'optim', 'optim_conf',
+            'sdpa_backend', 'save_per_step', 'grad_clip', 'optim', 'optim_conf',
             'scheduler', 'scheduler_conf', 'qwen_pretrain_path', 'onnx_path',
             'dist_backend',
         ]
@@ -747,7 +791,7 @@ def batch_forward(model, batch, scaler, info_dict, ref_model=None, dpo_loss=None
     else:
         autocast = torch.cuda.amp.autocast(enabled=True, dtype=dtype, cache_enabled=False)
 
-    with autocast:
+    with sdpa_kernel_context(info_dict.get('sdpa_backend', 'auto')), autocast:
         info_dict['loss_dict'] = model(batch, device)
         if ref_model is not None and dpo_loss is not None:
             chosen_logps = info_dict['loss_dict']["chosen_logps"]
